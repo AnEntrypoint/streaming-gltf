@@ -1772,6 +1772,10 @@ export class ModelPool extends Emitter {
     // (x0,y0,z0) -> (x1,y1,z1) over [start, start+dur]; on completion the entity
     // is removed from the map and its matrix is left resting at the target.
     this._movers = new Map(); // entity -> { x0,y0,z0, x1,y1,z1, start, dur }
+    // Far-tier GPU-lerp records (entity -> same shape). Written only on setTarget
+    // (O(1), never per-frame); used solely to sample current position for
+    // continuous mid-flight retargets. The actual interpolation is on the GPU.
+    this._farLerpState = new Map();
     this._nextEntityId = 0;
     this._totalBytes = 0;
     this._byteLog = new Map(); // assetUrl -> { url -> bytes }
@@ -2102,11 +2106,19 @@ export class ModelPool extends Emitter {
     // the entity's resting root.position.
     let sx, sy, sz;
     const cur = this._movers.get(entity);
+    const farCur = this._farLerpState && this._farLerpState.get(entity);
     if (cur) {
       const t = cur.dur > 0 ? Math.min(1, Math.max(0, (nowMs - cur.start) / cur.dur)) : 1;
       sx = cur.x0 + (cur.x1 - cur.x0) * t;
       sy = cur.y0 + (cur.y1 - cur.y0) * t;
       sz = cur.z0 + (cur.z1 - cur.z0) * t;
+    } else if (farCur) {
+      // Continuous retarget for a far entity mid-GPU-lerp: sample its current
+      // interpolated position (mirror of the shader math) as the new start.
+      const t = farCur.dur > 0 ? Math.min(1, Math.max(0, (nowMs - farCur.start) / farCur.dur)) : 1;
+      sx = farCur.x0 + (farCur.x1 - farCur.x0) * t;
+      sy = farCur.y0 + (farCur.y1 - farCur.y0) * t;
+      sz = farCur.z0 + (farCur.z1 - farCur.z0) * t;
     } else {
       const p = entity.root.position;
       sx = p.x; sy = p.y; sz = p.z;
@@ -2114,6 +2126,7 @@ export class ModelPool extends Emitter {
     if (durationMs <= 0) {
       // Instant: write position now, no mover record needed.
       this._movers.delete(entity);
+      if (this._farLerpState) this._farLerpState.delete(entity);
       this._clearFarLerp(entity);
       this._applyEntityPosition(entity, x, y, z);
       return;
@@ -2126,9 +2139,13 @@ export class ModelPool extends Emitter {
     // CPU mover for hero/mid tiers the shader lerp can't reach.
     if (this._setFarLerp(entity, sx, sy, sz, x, y, z, nowMs / 1000, durationMs / 1000)) {
       this._movers.delete(entity); // ensure no stale CPU mover double-drives it
-      // Keep root.position logically at the target so distance/LOD math and a
-      // later tier switch read a sane resting position (cheap, once, not /frame).
-      entity.root.position.set(x, y, z);
+      // Record the lerp CPU-side (O(1), only on retarget — NOT per frame) so a
+      // mid-flight retarget can sample the true current position for continuity.
+      this._farLerpState.set(entity, { x0: sx, y0: sy, z0: sz, x1: x, y1: y, z1: z, start: nowMs, dur: durationMs });
+      // Set root.position to the current START (not the target): distance/LOD
+      // read where the entity actually is now; it will settle toward the target
+      // as the GPU lerps. (One write, not per-frame.)
+      entity.root.position.set(sx, sy, sz);
       return;
     }
     this._movers.set(entity, { x0: sx, y0: sy, z0: sz, x1: x, y1: y, z1: z, start: nowMs, dur: durationMs });
@@ -2153,6 +2170,7 @@ export class ModelPool extends Emitter {
   }
 
   _clearFarLerp(entity) {
+    if (this._farLerpState) this._farLerpState.delete(entity);
     const tier = this._batchedFarTier;
     if (!tier) return;
     const id = tier.instanceIdFor(entity);
