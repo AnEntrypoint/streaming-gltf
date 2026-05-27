@@ -31,7 +31,9 @@ import { writeFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 
 const PORT = process.env.PORT || 5180;
-const STRESS_URL = `http://localhost:${PORT}/stress.html`;
+// 127.0.0.1 (not "localhost"): under CHANNEL=chrome, Playwright's localhost
+// resolution intermittently stalls page.goto even though the server is up.
+const STRESS_URL = `http://127.0.0.1:${PORT}/stress.html`;
 // Args are entity counts, or the literal "all" to spawn every distinct model.
 const ARGS = process.argv.slice(2);
 const COUNTS = ARGS.map((a) => (a === 'all' ? 'all' : Number(a))).filter((n) => n === 'all' || n > 0);
@@ -43,7 +45,7 @@ const SAMPLE_GAP_MS = 100;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function measureOne(page, n) {
-  await page.goto(`${STRESS_URL}?cb=${Date.now()}`, { waitUntil: 'domcontentloaded' });
+  await page.goto(`${STRESS_URL}?cb=${Date.now()}`, { waitUntil: 'commit', timeout: 60000 });
   await page.waitForFunction(() => window.__pool && window.__pool.getStats, { timeout: 30000 });
   // n === 'all' clicks the spawn-all-distinct-models button; otherwise spawn the
   // requested count by clicking the closest data-n presets repeatedly.
