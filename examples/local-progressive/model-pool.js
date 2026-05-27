@@ -1316,7 +1316,16 @@ class Entity extends Emitter {
       }
     }
     {
-      if (!tinyOnScreen && !this._subPixelCulled) {
+      // Re-pick LOD only when something that affects the choice changed since
+      // this entity last picked: the pool bumps _lodEpoch when the camera moved
+      // or _lodDistanceScale shifted beyond a quantum. A still camera + stable
+      // scale => epoch unchanged => no re-pick, no _applyLod churn. This is the
+      // core stutter fix: previously every visible textured-tier entity re-ran
+      // the picker every frame, and any boundary jitter (scale-hunting) flipped
+      // it, producing hundreds of switches/sec even with a still camera.
+      const lodEpochChanged = this._lodPickEpoch !== this.pool._lodEpoch;
+      if (lodEpochChanged) this._lodPickEpoch = this.pool._lodEpoch;
+      if (!tinyOnScreen && !this._subPixelCulled && lodEpochChanged) {
         for (const tm of this.trackedMeshes) {
           const desc = this.asset.meshLodDescs[tm.meshDescIdx];
           if (!desc) continue;
@@ -1329,8 +1338,35 @@ class Entity extends Emitter {
           // (wantInstanced/haveInstanced), so calling it here lets a FAR entity
           // promote to a higher textured LOD when the camera approaches and demote
           // back when it recedes.
-          const targetIdx = _pickMeshLod(desc.lods, screenPx, globalCeilingLod, this.pool._use3LodSystem, this.pool._lodDistanceScale);
-          if (targetIdx !== tm.currentLod) this._applyLod(tm, targetIdx, screenPx);
+          const targetIdx = _pickMeshLod(desc.lods, screenPx, globalCeilingLod, this.pool._use3LodSystem, this.pool._lodDistanceScale, tm.currentLod);
+          // HYSTERESIS + IN-FLIGHT GUARD. Without these the entity re-fires
+          // _applyLod every frame it sits near a LOD threshold (the picker has no
+          // dead-band) AND re-fires every frame while an async ensureMeshLod is
+          // still loading (the deferred path returns without setting currentLod),
+          // producing tens of thousands of switches and continuous stutter as
+          // the camera moves across the vertcolor<->textured band. Fix: only
+          // commit a switch after the SAME target has been requested for a few
+          // consecutive evaluations (debounce ping-pong), and never re-issue
+          // while a switch is already in flight.
+          if (targetIdx !== tm.currentLod && !tm._lodPending) {
+            if (tm._pendingLodTarget === targetIdx) {
+              tm._lodConfirm = (tm._lodConfirm || 0) + 1;
+            } else {
+              tm._pendingLodTarget = targetIdx;
+              tm._lodConfirm = 1;
+            }
+            const needed = this.pool._lodSwitchConfirmFrames ?? 4;
+            if (tm._lodConfirm >= needed) {
+              tm._lodConfirm = 0;
+              tm._pendingLodTarget = -1;
+              tm._lodPending = true;
+              const px = screenPx;
+              this._applyLod(tm, targetIdx, px).finally(() => { tm._lodPending = false; });
+            }
+          } else if (targetIdx === tm.currentLod) {
+            // Settled at target — reset the debounce so a future change starts fresh.
+            tm._pendingLodTarget = -1; tm._lodConfirm = 0;
+          }
           // Use pre-computed texture LODs (only meaningful for the non-instanced,
           // textured tiers; instanced FAR uses vertex color, no textures).
           if (!tm._instancedSlot && this.pool._enableTextureLod && tm._precomputedTexLods) {
@@ -1512,7 +1548,7 @@ function _cloneObject3D(src, sourceToClone) {
 // LOD picker — same logic as the inline demo, plus a ceiling clamp.
 // For 3-LOD system: uses thresholds [50px, 25px, 10px] for LODs [0, 2, 4]
 // For 5-LOD system: uses thresholds [80, 200, 400, 800, 1400] for LODs [0, 1, 2, 3, 4]
-function _pickMeshLod(lods, screenPx, ceilingIdx, use3LodSystem = false, lodScale = 1) {
+function _pickMeshLod(lods, screenPx, ceilingIdx, use3LodSystem = false, lodScale = 1, curLod = -1) {
   let thresholds, lodIndices;
   if (use3LodSystem && lods.length >= 5) {
     // 3-LOD system: only use LODs [0, 2, 4] with thresholds [50px, 25px, 10px]
@@ -1528,17 +1564,34 @@ function _pickMeshLod(lods, screenPx, ceilingIdx, use3LodSystem = false, lodScal
   // lodScale is the continuous FPS/VRAM control knob: scale the effective
   // on-screen size so the SAME picker chooses lower LODs sooner when the
   // controller wants cheaper frames (lodScale<1) or higher LODs when there's
-  // headroom (lodScale>1). This adjusts the LOD *distance* smoothly per entity
-  // instead of clamping a global ceiling between discrete tiers (which banged
-  // many entities across tiers at once and oscillated).
+  // headroom (lodScale>1).
   const effPx = screenPx * lodScale;
+
+  // HYSTERESIS: thresholds are descending (more px = more detail). The ladder
+  // index `i` counts how many thresholds effPx exceeds. Without a dead-band an
+  // entity sitting right at a threshold (or whose effPx jitters as lodScale and
+  // screenPx wobble) flips between adjacent LODs every frame — the continuous
+  // vertcolor<->textured stutter, and the low<->high ping-pong. We bias the
+  // comparison by the entity's CURRENT ladder index: to move UP a level effPx
+  // must clear the threshold by +margin; to drop DOWN it must fall below by
+  // -margin. Inside the band the current level is kept, so a still or slowly
+  // moving entity stays put.
+  const HYST = 0.18; // ±18% dead-band around each threshold
+  // current ladder index (position in lodIndices) for the entity's curLod
+  let curIdx = -1;
+  if (curLod >= 0) { const p = lodIndices.indexOf(curLod); if (p >= 0) curIdx = p; }
   let i = 0;
-  for (const t of thresholds) { if (effPx > t) i++; else break; }
+  for (let t = 0; t < thresholds.length; t++) {
+    const thr = thresholds[t];
+    // crossing from below (gaining detail, going to ladder index t+1) needs +margin;
+    // staying/falling uses -margin. Bias depends on whether we're currently above
+    // this boundary already.
+    const goingUpBoundary = curIdx <= t; // we'd be increasing past this threshold
+    const eff = goingUpBoundary ? thr * (1 + HYST) : thr * (1 - HYST);
+    if (effPx > eff) i++; else break;
+  }
   if (ceilingIdx != null) i = Math.min(i, ceilingIdx);
   const clampedIdx = Math.min(i, lodIndices.length - 1);
-
-  // If using 3-LOD, map the selected index to the actual LOD (0, 2, or 4)
-  // If using 5-LOD, the index maps directly (0, 1, 2, 3, or 4)
   return use3LodSystem ? lodIndices[clampedIdx] : clampedIdx;
 }
 function _pickTexLod(lods, screenPx) {
@@ -1721,7 +1774,13 @@ export class ModelPool extends Emitter {
     this._enableAnimThrottle = true;
     // 3-LOD Simplification: use only LODs [0, 2, 4], skip intermediate LODs 1 and 3
     // This saves ~40% VRAM and reduces memory allocation churn (default enabled)
-    this._use3LodSystem = opts.use3LodSystem !== false; // default true
+    // 5-LOD ladder by default now. The 3-LOD system used only LODs [0,2,4],
+    // which made entities jump straight between the lowest (unskinned) and
+    // highest (textured) tiers with nothing in between — the "swaps straight
+    // from lowest to highest instead of a good range" symptom. The full
+    // [0,1,2,3,4] ladder gives a smooth gradient; epoch-gated picking + picker
+    // hysteresis keep it from churning. Opt back into 3-LOD via opts.use3LodSystem.
+    this._use3LodSystem = opts.use3LodSystem === true; // default false (5-LOD)
     // ANGLE_multi_draw Optimizer: Batches 120+ FAR-tier draws into 1-3 submissions (+6-10 FPS)
     // Initialized lazily after draw call batching is enabled
     this._multiDrawOptimizer = null;
@@ -2213,6 +2272,16 @@ export class ModelPool extends Emitter {
       const moved = Math.abs(cp.x - lp.x) > 1e-3 || Math.abs(cp.y - lp.y) > 1e-3 || Math.abs(cp.z - lp.z) > 1e-3 || this.camera.fov !== lp.fov;
       this._cameraMoved = moved;
       if (moved) { lp.x = cp.x; lp.y = cp.y; lp.z = cp.z; lp.fov = this.camera.fov; }
+      // Bump the LOD-evaluation epoch when the camera moved OR the global LOD
+      // distance-scale shifted beyond a quantum since last frame. Entities only
+      // re-pick their LOD when the epoch changes (see Entity._update), so a
+      // still camera + stable scale produces zero per-frame LOD churn. Quantize
+      // the scale comparison so the controller's tiny proportional steps don't
+      // count as a change (that scale-hunting was the still-camera stutter).
+      if (this._lodEpoch == null) { this._lodEpoch = 1; this._lastLodScale = this._lodDistanceScale; this._cameraMoved = true; }
+      const scaleNow = this._lodDistanceScale || 1;
+      const scaleChanged = Math.abs(scaleNow - (this._lastLodScale ?? scaleNow)) > 0.04;
+      if (moved || scaleChanged) { this._lodEpoch++; this._lastLodScale = scaleNow; }
     }
     const vh = this.renderer.domElement.clientHeight;
     for (const slot of this._instancedSlots.values()) {
