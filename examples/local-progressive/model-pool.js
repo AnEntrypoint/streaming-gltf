@@ -936,13 +936,27 @@ class Entity extends Emitter {
       const cachedGeo = this.asset.geoCache.get(`${desc.meshIndex}:${desc.primIndex}:${wantIdx}`);
       if (cachedGeo) {
         geo = cachedGeo;
-      } else if (this.pool._enableDeferredStreaming && wantIdx === 0 && this._currentDistance > 30) {
-        // Not resident yet AND far away → queue for later load; keep current LOD.
-        const priority = -this._currentDistance; // negative distance (closer = higher priority)
-        this.pool._deferredLoadQueue.queueLoad(this.asset, tm.meshDescIdx, wantIdx, priority, this);
-        return;
       } else {
-        geo = await this.asset.ensureMeshLod(tm.meshDescIdx, wantIdx);
+        // NOT resident. Register the want with the frame-budgeted warm loader
+        // (network-lazy, GPU-eager, piecemeal) so we don't pay fetch+decode on
+        // the switch frame, AND record _lodWantIdx so the picker doesn't re-fire
+        // every frame for the same unresident target (that was the 11k churn).
+        tm._lodWantIdx = wantIdx;
+        this.pool._enqueueLodWarm(this.asset, tm.meshDescIdx, wantIdx, this._currentDistance);
+        // BUT do not strand the entity at an expensive LOD: if we currently have
+        // NO renderable geometry, or the target is a CHEAPER (lower) LOD than
+        // current (e.g. dropping to the far/unskinned tier to recover FPS), fall
+        // back to awaiting this load now — letting an entity stay stuck at a
+        // costly LOD because a cheaper one isn't cached yet deadlocks FPS.
+        const droppingToCheaper = wantIdx < tm.currentLod;
+        const haveRenderable = tm.mesh && tm.mesh.geometry && tm.mesh.geometry.attributes.position;
+        if (droppingToCheaper || !haveRenderable) {
+          geo = await this.asset.ensureMeshLod(tm.meshDescIdx, wantIdx);
+          if (this._disposed || !geo) return;
+          tm._lodWantIdx = -1;
+        } else {
+          return; // promoting to a richer LOD can wait for the warm loader
+        }
       }
     }
     if (this._disposed || !geo) return;
@@ -1348,7 +1362,14 @@ class Entity extends Emitter {
           // commit a switch after the SAME target has been requested for a few
           // consecutive evaluations (debounce ping-pong), and never re-issue
           // while a switch is already in flight.
-          if (targetIdx !== tm.currentLod && !tm._lodPending) {
+          // If we've already registered a want for this exact target and its geo
+          // is still not resident, don't re-invoke _applyLod — the warm loader
+          // owns it. This stops the per-frame cache-miss re-fire (was 11k/dolly).
+          const wantKey = `${desc.meshIndex}:${desc.primIndex}:${targetIdx}`;
+          const targetResident = desc.lods[targetIdx] && (desc.lods[targetIdx].inline || this.asset.geoCache.has(wantKey));
+          if (tm._lodWantIdx === targetIdx && !targetResident) {
+            // pending in the warm loader — leave it; it'll apply when resident.
+          } else if (targetIdx !== tm.currentLod && !tm._lodPending) {
             if (tm._pendingLodTarget === targetIdx) {
               tm._lodConfirm = (tm._lodConfirm || 0) + 1;
             } else {
@@ -1364,6 +1385,7 @@ class Entity extends Emitter {
               this._applyLod(tm, targetIdx, px).finally(() => { tm._lodPending = false; });
             }
           } else if (targetIdx === tm.currentLod) {
+            tm._lodWantIdx = -1;
             // Settled at target — reset the debounce so a future change starts fresh.
             tm._pendingLodTarget = -1; tm._lodConfirm = 0;
           }
@@ -1699,6 +1721,14 @@ export class ModelPool extends Emitter {
     // LOD picker. <1 = models drop to lower LODs sooner (cheaper); >1 = detail
     // extends farther. Driven by the closed-loop controller in update().
     this._lodDistanceScale = 1;
+    // Frame-budgeted LOD warm loader: LODs the picker wants but that aren't yet
+    // GPU-resident are registered here and processed PIECEMEAL, only when FPS
+    // has headroom, so fetch+decode+GPU-upload never lands on a switch frame.
+    // Network stays lazy (fetch on demand); GPU upload is eager once decoded.
+    this._lodWarmQueue = new Map();   // key -> { asset, meshDescIdx, lodIdx, dist }
+    this._lodWarmInFlight = 0;
+    this._lodWarmMaxInFlight = opts.lodWarmMaxInFlight ?? 3; // concurrent decodes
+    this._lodWarmPerFrame = opts.lodWarmPerFrame ?? 2;        // starts per frame (headroom-gated)
     // Asset Streaming: Deferred load queue + unload manager
     this._deferredLoadQueue = new DeferredLoadQueue(opts.maxConcurrentDefers ?? 2);
     this._lodUnloadManager = new LodUnloadManager(opts.vramBudgetMB ?? 200);
@@ -2028,6 +2058,82 @@ export class ModelPool extends Emitter {
     if (newUvArray) newGeo.setAttribute('uv', new THREE.BufferAttribute(newUvArray, 2));
 
     return newGeo;
+  }
+
+  // Register a wanted-but-not-resident LOD for the frame-budgeted warm loader.
+  // Cheap + idempotent: just records the want (nearest distance wins priority).
+  _enqueueLodWarm(asset, meshDescIdx, lodIdx, dist) {
+    const desc = asset.meshLodDescs[meshDescIdx];
+    if (!desc) return;
+    const t = desc.lods[lodIdx];
+    if (!t || t.inline) return; // inline LODs are always resident
+    const key = `${asset.url}#${desc.meshIndex}:${desc.primIndex}:${lodIdx}`;
+    if (asset.geoCache.has(`${desc.meshIndex}:${desc.primIndex}:${lodIdx}`)) return; // already resident
+    const ex = this._lodWarmQueue.get(key);
+    if (ex) { if (dist < ex.dist) ex.dist = dist; return; }
+    this._lodWarmQueue.set(key, { asset, meshDescIdx, lodIdx, dist });
+  }
+
+  // Process the warm queue PIECEMEAL: only when FPS has headroom, start at most
+  // _lodWarmPerFrame decodes/frame and cap concurrent in-flight. Each item
+  // fetches (lazy) + decodes (worker) via ensureMeshLod, then GPU-warms the
+  // resulting geometry so the eventual LOD switch pays no first-use upload.
+  // Nearest-first. Called once per frame from update().
+  _drainLodWarm() {
+    if (this._lodWarmQueue.size === 0) return;
+    // Adaptive budget: more starts when FPS has headroom, but NEVER zero —
+    // gating warming off entirely below target deadlocks (entities that need a
+    // cheaper far LOD to recover FPS can never get it, so FPS stays low forever
+    // and the queue never drains). Always allow at least 1 decode/frame so the
+    // scene can progress toward its resting LODs; ramp up with headroom.
+    const target = this.targetFps || 60;
+    let starts;
+    if (this._fpsEma >= target + 5) starts = this._lodWarmPerFrame * 2;
+    else if (this._fpsEma >= target - 8) starts = this._lodWarmPerFrame;
+    else starts = 1; // struggling — minimum forward progress, no zero-deadlock
+    // Pick nearest-first without sorting the whole map every frame: a cheap
+    // single linear min-scan per start (queue is small in practice).
+    while (starts-- > 0 && this._lodWarmInFlight < this._lodWarmMaxInFlight && this._lodWarmQueue.size) {
+      let bestKey = null, bestDist = Infinity;
+      for (const [k, v] of this._lodWarmQueue) { if (v.dist < bestDist) { bestDist = v.dist; bestKey = k; } }
+      if (bestKey == null) break;
+      const item = this._lodWarmQueue.get(bestKey);
+      this._lodWarmQueue.delete(bestKey);
+      this._lodWarmInFlight++;
+      Promise.resolve(item.asset.ensureMeshLod(item.meshDescIdx, item.lodIdx))
+        .then((geo) => { if (geo) this._gpuWarmGeometry(geo); })
+        .catch(() => {})
+        .finally(() => { this._lodWarmInFlight--; });
+    }
+  }
+
+  // Eagerly upload a geometry's buffers to the GPU so a later draw with it does
+  // not stall on first use. THREE uploads attributes lazily at first render;
+  // renderer.initGeometry (r0.16x+ via WebGLAttributes) isn't public, so we use
+  // the documented path: renderer.compile won't upload geometry, but rendering
+  // it once into the current target does. To avoid a visible flash we draw it
+  // through an off-screen 1x1 scratch with a tiny ortho cam. Cheap (1 tri batch
+  // of already-decimated geo) and one-shot per geometry.
+  _gpuWarmGeometry(geo) {
+    if (!geo || geo.__gpuWarmed) return;
+    try {
+      if (!this._warmScene) {
+        this._warmScene = new THREE.Scene();
+        this._warmCam = new THREE.Camera();
+        this._warmMat = new THREE.MeshBasicMaterial();
+        this._warmMesh = new THREE.Mesh(undefined, this._warmMat);
+        this._warmMesh.frustumCulled = false;
+        this._warmScene.add(this._warmMesh);
+        this._warmTarget = new THREE.WebGLRenderTarget(1, 1);
+      }
+      const prevTarget = this.renderer.getRenderTarget();
+      this._warmMesh.geometry = geo;
+      this.renderer.setRenderTarget(this._warmTarget);
+      this.renderer.render(this._warmScene, this._warmCam); // forces buffer upload
+      this.renderer.setRenderTarget(prevTarget);
+      this._warmMesh.geometry = undefined;
+      geo.__gpuWarmed = true;
+    } catch (e) { /* warming is best-effort; a cold first-use is the fallback */ }
   }
 
   // Get-or-create an InstancedSlot for an (asset, meshDescIdx, lod) tuple.
@@ -2499,6 +2605,10 @@ export class ModelPool extends Emitter {
     const tBudget0 = performance.now();
     this._enforceBudget();
     const tBudget1 = performance.now();
+    // Frame-budgeted, headroom-gated warm loading of wanted-but-unresident LODs
+    // (network-lazy, GPU-eager, piecemeal) so LOD switches never pay a fetch /
+    // decode / first-use upload on the switch frame.
+    this._drainLodWarm();
     if (this._totalBytes > this.byteBudget && this.midPx < 200) {
       // Larger midPx → wider FAR catch (entities up to midPx screen-size).
       this.midPx = Math.min(200, this.midPx + 5);
