@@ -1,20 +1,39 @@
 {
   "name": "streaming-gltf",
   "version": "1.0.0",
-  "private": true,
-  "description": "Streaming progressive glTF LOD renderer (examples/local-progressive) plus the local bake/convert + streaming-download pipeline (tools/bake-*.mjs).",
+  "description": "Streaming progressive glTF LOD renderer (BatchedMesh/InstancedMesh tiers, network-lazy GPU-eager LOD streaming, on-GPU position lerping) plus the local bake/convert + streaming-download pipeline (tools/bake-*.mjs).",
   "license": "MIT",
   "type": "module",
+  "main": "./index.js",
+  "module": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./model-pool": "./examples/local-progressive/model-pool.js",
+    "./batched-far-tier": "./examples/local-progressive/batched-far-tier.js"
+  },
+  "files": [
+    "index.js",
+    "examples/local-progressive/*.js",
+    "tools/*.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
   "repository": {
     "type": "git",
     "url": "git+https://github.com/AnEntrypoint/streaming-gltf.git"
   },
+  "homepage": "https://anentrypoint.github.io/streaming-gltf/",
   "scripts": {
     "bake:local": "node tools/bake-progressive.mjs",
     "bake:all": "node tools/bake-all.mjs",
     "bake:stream": "node tools/bake-streaming.mjs",
     "demo:local": "node examples/local-progressive/serve.mjs",
     "measure": "node examples/local-progressive/measure-fps.mjs"
+  },
+  "peerDependencies": {
+    "three": ">= 0.160.0",
+    "@pixiv/three-vrm": ">= 3.0.0"
   },
   "devDependencies": {
     "@gltf-transform/core": "^4.3.0",

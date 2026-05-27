@@ -4,6 +4,37 @@ A self-contained three.js renderer for large scenes of distinct glTF/GLB models
 with progressive LOD streaming, plus the local pipeline that converts source
 models into the progressive format it consumes.
 
+## Live demo
+
+**https://anentrypoint.github.io/streaming-gltf/** — the stress demo, deployed
+from `examples/local-progressive/` by `.github/workflows/deploy-pages.yml`. It
+ships code only: `three` loads from a CDN (importmap) and the baked models are
+streamed **cross-origin** from the assets host
+(`https://anentrypoint.github.io/assets/`, derived from its
+`manifest.baked.json`). Override the asset source with `?assets=<baseUrl>`, or
+use `?assets=local` with the dev server (`npm run demo:local`).
+
+## SDK usage
+
+`streaming-gltf` is an importable ES module. `three` and `@pixiv/three-vrm` are
+**peer dependencies** — provide them yourself (e.g. via an importmap pointing at
+a CDN build, or your bundler); they are not bundled.
+
+```js
+import { ModelPool } from 'streaming-gltf';
+// or: import { BatchedFarTier } from 'streaming-gltf/batched-far-tier';
+
+const pool = new ModelPool({ scene, renderer, camera });
+const entity = pool.spawn(url, { position: [x, 0, z] });
+
+// per frame, after advancing the camera:
+pool.update();
+
+// sparse position targets — the GPU interpolates each frame (far tier),
+// so moving entities cost ~no per-frame CPU matrix writes:
+pool.setTarget(entity, x, y, z, durationMs);
+```
+
 ## Layout
 
 - `examples/local-progressive/` — the renderer (latest). Entry: `stress.html` →

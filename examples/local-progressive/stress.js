@@ -5,13 +5,31 @@ import * as THREE from 'three';
 import { ModelPool } from './model-pool.js';
 import { enableDrawCallBatching } from './draw-call-batching.js';
 
-// Asset list fetched from server /assets-list.json at boot. Server walks
-// the examples/local-progressive directory and emits every output_* dir.
-let ASSET_DIRS = [];
-const ASSET_DIRS_READY = fetch('/assets-list.json')
-  .then((r) => r.json())
-  .then((list) => { ASSET_DIRS = list; console.log(`[stress] ${list.length} assets discovered`); return list; })
-  .catch((e) => { console.error('[stress] asset-list fetch failed', e); ASSET_DIRS = []; });
+// Asset source. By default the baked models are loaded CROSS-ORIGIN from the
+// public assets host (its own GitHub Pages site) so this repo ships code only —
+// no model bytes, no LFS. Override with ?assets=<baseUrl>, or ?assets=local to
+// use the dev server's generated /assets-list.json + relative output_* paths
+// (npm run demo:local). ASSET_DIRS ends up holding FULLY-RESOLVED .glb URLs.
+const _assetsParam = new URLSearchParams(location.search).get('assets');
+const ASSET_HOST_DEFAULT = 'https://anentrypoint.github.io/assets/';
+const ASSET_BASE = (!_assetsParam || _assetsParam === 'remote')
+  ? ASSET_HOST_DEFAULT
+  : (_assetsParam === 'local' ? null : (_assetsParam.endsWith('/') ? _assetsParam : _assetsParam + '/'));
+
+let ASSET_DIRS = []; // fully-resolved model.progressive.glb URLs
+const ASSET_DIRS_READY = (ASSET_BASE === null
+  // LOCAL DEV: dynamic /assets-list.json from serve.mjs -> relative glb paths.
+  ? fetch('/assets-list.json').then((r) => r.json())
+      .then((list) => list.map((dir) => `${dir}/model.progressive.glb`))
+  // REMOTE: the assets host's manifest.baked.json (category -> [{baked,...}]).
+  // Flatten and resolve each `baked` (streaming/output_xxx/model.progressive.glb)
+  // against ASSET_BASE so models stream cross-origin.
+  : fetch(`${ASSET_BASE}manifest.baked.json`).then((r) => r.json())
+      .then((manifest) => Object.values(manifest).flat()
+        .map((e) => e && e.baked).filter(Boolean)
+        .map((baked) => ASSET_BASE + baked)))
+  .then((urls) => { ASSET_DIRS = urls; console.log(`[stress] ${urls.length} assets discovered (${ASSET_BASE || 'local'})`); return urls; })
+  .catch((e) => { console.error('[stress] asset list fetch failed', e); ASSET_DIRS = []; });
 
 const canvas = document.getElementById('c');
 const hud = document.getElementById('hud');
@@ -88,8 +106,8 @@ async function spawnUnique(n) {
       for (let col = 0; col < side && count < n; col++) {
         const x = (col - side / 2) * spacing;
         const z = (row - side / 2) * spacing;
-        const asset = ASSET_DIRS[count % ASSET_DIRS.length];
-        const proxy = pool.spawn(`${asset}/model.progressive.glb`, {
+        const assetUrl = ASSET_DIRS[count % ASSET_DIRS.length];
+        const proxy = pool.spawn(assetUrl, {
           position: [x, 0, z],
           rotation: [0, (count * 0.137) % (Math.PI * 2), 0],
           static: true,
