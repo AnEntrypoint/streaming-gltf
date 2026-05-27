@@ -16,42 +16,13 @@ const ASSET_DIRS_READY = fetch('/assets-list.json')
 const canvas = document.getElementById('c');
 const hud = document.getElementById('hud');
 
-// Renderer factory: WebGL by default (the proven path). Opt into WebGPU with
-// ?backend=webgpu when the browser supports it (navigator.gpu); falls back to
-// WebGL with a console notice otherwise. The WebGPURenderer (three/webgpu build)
-// renders the SAME standard-three scene the pool builds — verified by
-// webgpu-probe.mjs — so no scene/material rewrite is needed; our onBeforeCompile
-// GLSL patches simply don't run under WebGPU (three uses its default shaders).
-async function createRenderer() {
-  const params = new URLSearchParams(location.search);
-  const wantGpu = params.get('backend') === 'webgpu';
-  if (wantGpu && typeof navigator !== 'undefined' && navigator.gpu) {
-    try {
-      const WGPU = await import('three/webgpu');
-      const r = new WGPU.WebGPURenderer({ canvas, antialias: false });
-      await r.init();
-      r.__backend = 'webgpu';
-      console.log('[stress] WebGPU renderer initialized');
-      return r;
-    } catch (e) {
-      console.warn('[stress] WebGPU init failed, falling back to WebGL:', e && e.message || e);
-    }
-  } else if (wantGpu) {
-    console.warn('[stress] ?backend=webgpu requested but navigator.gpu unavailable; using WebGL');
-  }
-  const r = new THREE.WebGLRenderer({ canvas, antialias: false, powerPreference: 'high-performance' });
-  r.__backend = 'webgl';
-  return r;
-}
-const renderer = await createRenderer();
-window.__backend = renderer.__backend;
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, powerPreference: 'high-performance' });
 renderer.setPixelRatio(1);
 // Opaque-only scene: skip THREE's per-frame transparency depth-sort of the
 // render list. Also stop auto-resetting renderer.info every render (we read it
-// from the HUD; reset manually once per frame in tick()). WebGPURenderer exposes
-// a compatible .info; guard the rare field that may be absent.
+// from the HUD; reset manually once per frame in tick()).
 renderer.sortObjects = false;
-if (renderer.info) renderer.info.autoReset = false;
+renderer.info.autoReset = false;
 const scene = new THREE.Scene();
 // All scene roots here are static (entities self-manage their matrices via the
 // pool); disable the per-frame matrix-world traversal recompute on the scene
@@ -559,9 +530,8 @@ function tick() {
   }
   renderer.render(scene, camera);
   // renderer.info.autoReset is off; reset once per frame after rendering so the
-  // HUD's draw-call/triangle counts reflect exactly one frame. (WebGPURenderer
-  // exposes a compatible info object; guard in case a field is missing.)
-  if (renderer.info && renderer.info.reset) renderer.info.reset();
+  // HUD's draw-call/triangle counts reflect exactly one frame.
+  renderer.info.reset();
   // HUD + frame-chart are diagnostics only — rebuilding the big innerHTML string
   // and redrawing the chart every frame causes layout/paint churn. Throttle to
   // ~10Hz (every 6th frame); rendering itself stays at full rate.
