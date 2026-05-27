@@ -1114,6 +1114,12 @@ class Entity extends Emitter {
       // distance the mip chain isn't worth the upload/bandwidth. These run on the
       // per-entity baseMaterial (not the shared pool material), so it's safe.
       const farLod = wantIdx >= 3;
+      // Anisotropic filtering on the close, mipmapped tiers (wantIdx < 3) keeps
+      // oblique surfaces sharp at near-zero cost on a draws~0 GPU-bound scene.
+      // Cached once off the renderer; capped at 8 so we never overpay on GPUs
+      // that advertise 16x. Far LODs skip it (no mipmaps, linear-only).
+      const aniso = this.pool._maxAnisotropy ??
+        (this.pool._maxAnisotropy = Math.min(8, this.pool.renderer?.capabilities?.getMaxAnisotropy?.() ?? 1));
       for (const tex of targets) {
         tex.dispose();
         tex.image = bmp;
@@ -1121,6 +1127,9 @@ class Entity extends Emitter {
           tex.minFilter = THREE.LinearFilter;
           tex.magFilter = THREE.LinearFilter;
           tex.generateMipmaps = false;
+          tex.anisotropy = 1;
+        } else {
+          tex.anisotropy = aniso;
         }
         tex.needsUpdate = true;
       }
@@ -1729,6 +1738,7 @@ export class ModelPool extends Emitter {
     this._lodWarmInFlight = 0;
     this._lodWarmMaxInFlight = opts.lodWarmMaxInFlight ?? 3; // concurrent decodes
     this._lodWarmPerFrame = opts.lodWarmPerFrame ?? 2;        // starts per frame (headroom-gated)
+    this._gpuWarmPending = [];        // decoded geos awaiting GPU upload, 1/frame
     // Asset Streaming: Deferred load queue + unload manager
     this._deferredLoadQueue = new DeferredLoadQueue(opts.maxConcurrentDefers ?? 2);
     this._lodUnloadManager = new LodUnloadManager(opts.vramBudgetMB ?? 200);
@@ -2101,9 +2111,32 @@ export class ModelPool extends Emitter {
       this._lodWarmQueue.delete(bestKey);
       this._lodWarmInFlight++;
       Promise.resolve(item.asset.ensureMeshLod(item.meshDescIdx, item.lodIdx))
-        .then((geo) => { if (geo) this._gpuWarmGeometry(geo); })
+        .then((geo) => { if (geo && !geo.__gpuWarmed) this._gpuWarmPending.push(geo); })
         .catch(() => {})
         .finally(() => { this._lodWarmInFlight--; });
+    }
+  }
+
+  // Synchronous GPU warm (a renderer.render() into a 1x1 target) is the one
+  // spiky part of warming: several decode promises can resolve in the same
+  // frame and, done inline, fire N back-to-back renders → a frame-time burst
+  // that shows up as the min-FPS dip during streaming. Decouple decode (kept
+  // parallel) from upload (drained here at most ONE per frame) so the cost is
+  // spread across frames instead of bunched. Called once per frame in update().
+  _drainGpuWarm() {
+    if (!this._gpuWarmPending.length) return;
+    // Adaptive per-frame upload budget: spread uploads to avoid the burst that
+    // caused the min-FPS dip, but NEVER throttle so hard that a large scene
+    // can't reach its resting LODs. With headroom, drain aggressively (the
+    // backlog clears fast during initial streaming); near/below target, drip.
+    const target = this.targetFps || 60;
+    let budget;
+    if (this._fpsEma >= target + 5) budget = 8;
+    else if (this._fpsEma >= target - 8) budget = 3;
+    else budget = 1; // struggling — one upload/frame, still forward progress
+    while (budget-- > 0 && this._gpuWarmPending.length) {
+      const geo = this._gpuWarmPending.shift();
+      if (geo && !geo.__gpuWarmed) this._gpuWarmGeometry(geo);
     }
   }
 
@@ -2609,6 +2642,7 @@ export class ModelPool extends Emitter {
     // (network-lazy, GPU-eager, piecemeal) so LOD switches never pay a fetch /
     // decode / first-use upload on the switch frame.
     this._drainLodWarm();
+    this._drainGpuWarm(); // at most one synchronous GPU upload per frame
     if (this._totalBytes > this.byteBudget && this.midPx < 200) {
       // Larger midPx → wider FAR catch (entities up to midPx screen-size).
       this.midPx = Math.min(200, this.midPx + 5);
