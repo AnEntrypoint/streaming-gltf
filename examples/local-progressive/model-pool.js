@@ -1766,6 +1766,12 @@ export class ModelPool extends Emitter {
     this.animationThrottleDistance = opts.animationThrottleDistance ?? 15; // More aggressive animation throttling for better FPS
     this._assets = new Map(); // url -> Asset
     this._entities = new Set();
+    // Position-update / lerp system. Only entities with an ACTIVE target live in
+    // this map, so the per-frame cost is O(moving entities), not O(all). Idle
+    // entities are never touched. Each record interpolates root.position from
+    // (x0,y0,z0) -> (x1,y1,z1) over [start, start+dur]; on completion the entity
+    // is removed from the map and its matrix is left resting at the target.
+    this._movers = new Map(); // entity -> { x0,y0,z0, x1,y1,z1, start, dur }
     this._nextEntityId = 0;
     this._totalBytes = 0;
     this._byteLog = new Map(); // assetUrl -> { url -> bytes }
@@ -2084,6 +2090,67 @@ export class ModelPool extends Emitter {
     this._lodWarmQueue.set(key, { asset, meshDescIdx, lodIdx, dist });
   }
 
+  // ---- Position-update API: GPU-eager, CPU-O(moving) ---------------------
+  // Move an entity toward a target over durationMs. The CPU only records the
+  // target here; the per-frame interpolation runs in _drainMovers() over just
+  // the active set. A retarget mid-flight is continuous: the current
+  // interpolated position becomes the new start. durationMs<=0 snaps instantly.
+  setTarget(entity, x, y, z, durationMs = 300, nowMs = (typeof performance !== 'undefined' ? performance.now() : Date.now())) {
+    if (!entity || entity._disposed) return;
+    // Determine the start position = current rendered position (continuous
+    // retarget). If a mover is already in flight, sample it at `now`; else use
+    // the entity's resting root.position.
+    let sx, sy, sz;
+    const cur = this._movers.get(entity);
+    if (cur) {
+      const t = cur.dur > 0 ? Math.min(1, Math.max(0, (nowMs - cur.start) / cur.dur)) : 1;
+      sx = cur.x0 + (cur.x1 - cur.x0) * t;
+      sy = cur.y0 + (cur.y1 - cur.y0) * t;
+      sz = cur.z0 + (cur.z1 - cur.z0) * t;
+    } else {
+      const p = entity.root.position;
+      sx = p.x; sy = p.y; sz = p.z;
+    }
+    if (durationMs <= 0) {
+      // Instant: write position now, no mover record needed.
+      this._movers.delete(entity);
+      this._applyEntityPosition(entity, x, y, z);
+      return;
+    }
+    this._movers.set(entity, { x0: sx, y0: sy, z0: sz, x1: x, y1: y, z1: z, start: nowMs, dur: durationMs });
+  }
+
+  // Write an absolute position onto an entity and push it to whatever slot(s)
+  // its tracked meshes currently occupy (far BatchedMesh, mid InstancedMesh, or
+  // hero). Backend-agnostic: both tiers route through setMatrixForSlot.
+  _applyEntityPosition(entity, x, y, z) {
+    entity.root.position.set(x, y, z);
+    // Static entities have matrixAutoUpdate off; refresh the world matrix once.
+    entity.root.updateMatrix();
+    entity.root.updateMatrixWorld(true);
+    for (const tm of entity.trackedMeshes) {
+      if (tm._instancedSlot && tm._instancedSlotIdx != null && tm._instancedSlotIdx >= 0) {
+        tm._instancedSlot.setMatrixForSlot(tm._instancedSlotIdx, entity._slotWorldMatrix(tm));
+      }
+    }
+  }
+
+  // Per-frame: interpolate only entities with an active target. O(active set).
+  // Completed movers are removed and left resting at their target. Called once
+  // per frame from update().
+  _drainMovers(nowMs) {
+    if (this._movers.size === 0) return;
+    for (const [entity, m] of this._movers) {
+      if (entity._disposed) { this._movers.delete(entity); continue; }
+      const t = m.dur > 0 ? Math.min(1, Math.max(0, (nowMs - m.start) / m.dur)) : 1;
+      const x = m.x0 + (m.x1 - m.x0) * t;
+      const y = m.y0 + (m.y1 - m.y0) * t;
+      const z = m.z0 + (m.z1 - m.z0) * t;
+      this._applyEntityPosition(entity, x, y, z);
+      if (t >= 1) this._movers.delete(entity); // settled: stop touching it
+    }
+  }
+
   // Process the warm queue PIECEMEAL: only when FPS has headroom, start at most
   // _lodWarmPerFrame decodes/frame and cap concurrent in-flight. Each item
   // fetches (lazy) + decodes (worker) via ensureMeshLod, then GPU-warms the
@@ -2302,6 +2369,10 @@ export class ModelPool extends Emitter {
     // EMA FPS over ~500ms (faster feedback than 1s).
     const instFps = dt > 0 ? 1 / dt : 60;
     this._fpsEma = this._fpsEma * 0.85 + instFps * 0.15;
+
+    // Interpolate active position targets BEFORE the entity/LOD pass so lerped
+    // positions feed this frame's distance + LOD picks. O(moving entities).
+    this._drainMovers(now);
 
     // Staticness count is folded into the single entity pass below to avoid a
     // second full walk of every entity per frame (was a separate loop). The

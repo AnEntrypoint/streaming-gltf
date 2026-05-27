@@ -467,6 +467,27 @@ document.getElementById('export-btn').addEventListener('click', () => {
   }
 });
 
+// Retarget ~3% of entities per frame to a fresh random nearby position over a
+// 600-1400ms ease. Touching only a sparse subset each frame is the whole point:
+// CPU work is O(subset) while ALL in-flight entities keep lerping on the GPU/CPU
+// active set inside the pool. Demonstrates "fully capable of position updates".
+let _moverScratch = [];
+function _driveMovers() {
+  const ents = _moverScratch;
+  ents.length = 0;
+  for (const e of pool._entities) { if (!e._disposed) ents.push(e); }
+  if (!ents.length) return;
+  const n = Math.max(1, Math.round(ents.length * 0.03));
+  for (let i = 0; i < n; i++) {
+    const e = ents[(Math.random() * ents.length) | 0];
+    const base = e.root.position;
+    const tx = base.x + (Math.random() - 0.5) * 4;
+    const ty = Math.max(0, base.y + (Math.random() - 0.5) * 1.5);
+    const tz = base.z + (Math.random() - 0.5) * 4;
+    pool.setTarget(e, tx, ty, tz, 600 + Math.random() * 800);
+  }
+}
+
 let orbitT = 0;
 let zoomPhase = 0;
 let _prevCamX = Infinity, _prevCamY = 0, _prevCamZ = 0;
@@ -496,7 +517,14 @@ function tick() {
   const cp = camera.position;
   const camMoved = Math.abs(cp.x - _prevCamX) > 1e-3 || Math.abs(cp.y - _prevCamY) > 1e-3 || Math.abs(cp.z - _prevCamZ) > 1e-3;
   _prevCamX = cp.x; _prevCamY = cp.y; _prevCamZ = cp.z;
-  if (camMoved || (_poolUpdateCounter++ % 3) === 0) {
+  // Position-update demo: each frame retarget a SMALL random subset of entities
+  // (proving O(updated) CPU cost) while the pool lerps every active mover on its
+  // side. The interpolation makes them drift smoothly to new targets.
+  const moversOn = document.getElementById('movers') && document.getElementById('movers').checked;
+  if (moversOn) _driveMovers();
+  // Movers (or a moving camera) need update() every frame for smooth motion;
+  // a fully static scene can keep the 3rd-frame throttle.
+  if (camMoved || moversOn || (_poolUpdateCounter++ % 3) === 0) {
     pool.update();
   }
   renderer.render(scene, camera);
