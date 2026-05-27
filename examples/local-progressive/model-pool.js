@@ -2114,10 +2114,49 @@ export class ModelPool extends Emitter {
     if (durationMs <= 0) {
       // Instant: write position now, no mover record needed.
       this._movers.delete(entity);
+      this._clearFarLerp(entity);
       this._applyEntityPosition(entity, x, y, z);
       return;
     }
+    // GPU-LERP FAST PATH: if every tracked mesh of this entity lives on the
+    // BatchedMesh far tier, push the interpolation onto the GPU (write 2 texels)
+    // and DO NOT register a CPU mover — the vertex shader interpolates each
+    // frame, so the CPU writes nothing per-frame for this entity (only this
+    // sparse texel write + the once-per-frame uNow uniform). Falls through to the
+    // CPU mover for hero/mid tiers the shader lerp can't reach.
+    if (this._setFarLerp(entity, sx, sy, sz, x, y, z, nowMs / 1000, durationMs / 1000)) {
+      this._movers.delete(entity); // ensure no stale CPU mover double-drives it
+      // Keep root.position logically at the target so distance/LOD math and a
+      // later tier switch read a sane resting position (cheap, once, not /frame).
+      entity.root.position.set(x, y, z);
+      return;
+    }
     this._movers.set(entity, { x0: sx, y0: sy, z0: sz, x1: x, y1: y, z1: z, start: nowMs, dur: durationMs });
+  }
+
+  // Try to drive an entity's interpolation entirely on the GPU via the far tier.
+  // Returns true only if the entity is fully resident on the BatchedFarTier (all
+  // tracked meshes batched-far with a valid instance id), so the CPU can skip it.
+  _setFarLerp(entity, x0, y0, z0, x1, y1, z1, startSec, durSec) {
+    const tier = this._batchedFarTier;
+    if (!tier) return false;
+    if (!entity.trackedMeshes || entity.trackedMeshes.length === 0) return false;
+    const id = tier.instanceIdFor(entity);
+    if (id < 0) return false;
+    // Every tracked mesh must be on the far tier (else part of the entity would
+    // not interpolate). In practice the far tier carries the whole entity.
+    for (const tm of entity.trackedMeshes) {
+      if (!tm._instancedSlot || !tm._instancedSlot._batchedFar) return false;
+    }
+    tier.setLerpTarget(id, x0, y0, z0, x1, y1, z1, startSec, durSec);
+    return true;
+  }
+
+  _clearFarLerp(entity) {
+    const tier = this._batchedFarTier;
+    if (!tier) return;
+    const id = tier.instanceIdFor(entity);
+    if (id >= 0) tier.clearLerp(id);
   }
 
   // Write an absolute position onto an entity and push it to whatever slot(s)
@@ -2370,8 +2409,15 @@ export class ModelPool extends Emitter {
     const instFps = dt > 0 ? 1 / dt : 60;
     this._fpsEma = this._fpsEma * 0.85 + instFps * 0.15;
 
+    // Push the monotonic clock to the GPU-lerp shader once per frame — the ONLY
+    // per-frame CPU->GPU write for far entities interpolating on the GPU. (The
+    // far tier reads it via the uNow uniform; entities in flight need no matrix
+    // write at all.)
+    if (this._batchedFarTier) this._batchedFarTier.updateNow(now / 1000);
+
     // Interpolate active position targets BEFORE the entity/LOD pass so lerped
     // positions feed this frame's distance + LOD picks. O(moving entities).
+    // (CPU fallback path for hero/mid tiers; far entities use the GPU lerp above.)
     this._drainMovers(now);
 
     // Staticness count is folded into the single entity pass below to avoid a

@@ -96,13 +96,26 @@ export class BatchedFarTier {
     // symptom was actually near-black models being counted as background). Unlit
     // shows the baked vertex colors directly. Also cheaper fragment cost (fill).
     const material = new THREE.MeshBasicMaterial({ vertexColors: true });
+
+    // ---- On-GPU position lerp -------------------------------------------
+    // Per-instance interpolation data lives in a parallel float texture indexed
+    // by the BatchedMesh instance id (getIndirectIndex(gl_DrawID) in r0.170).
+    // 2 texels/instance: texel0 = pos0.xyz + startTime(.w), texel1 = pos1.xyz +
+    // duration(.w). When duration>0 the vertex shader OVERRIDES the batching
+    // matrix's translation column with mix(pos0,pos1,t) where t = clamp((uNow -
+    // startTime)/duration, 0, 1) — rotation/scale from setMatrixAt are kept.
+    // The CPU writes these 2 texels only on a sparse setTarget and bumps a single
+    // uNow uniform once per frame: entities in flight cost ZERO per-frame matrix
+    // writes (the whole interpolation runs on the GPU).
+    this._lerpTexelsPerInstance = 2;
+    this._initLerpTexture(this.maxInstances);
+    this._uNow = { value: 0 };
+
     material.onBeforeCompile = (shader) => {
-      // sRGB->linear decode moved from PER-FRAGMENT to PER-VERTEX: the baked
-      // vertex colors are sRGB bytes; instead of pow(vColor,2.2) for every pixel
-      // we decode once per vertex (vColor is then interpolated linear). For the
-      // low-poly far tier that's far fewer pow() calls than fragments. Visually
-      // ~identical (linear interpolation of decoded colors). Fragment keeps the
-      // stock <color_fragment> (plain diffuseColor *= vColor).
+      shader.uniforms.uLerpTex = { value: this._lerpTex };
+      shader.uniforms.uLerpTexW = { value: this._lerpTexW };
+      shader.uniforms.uNow = this._uNow;
+      // sRGB->linear decode moved PER-FRAGMENT -> PER-VERTEX (cheap on low-poly far).
       shader.vertexShader = shader.vertexShader.replace(
         '#include <color_vertex>',
         `#include <color_vertex>
@@ -110,6 +123,39 @@ export class BatchedFarTier {
           vColor.rgb = pow(vColor.rgb, vec3(2.2));
         #elif defined( USE_COLOR )
           vColor = pow(vColor, vec3(2.2));
+        #endif`,
+      );
+      // Declare the lerp sampler + uNow (pars), and a texelFetch helper.
+      shader.vertexShader = shader.vertexShader.replace(
+        '#include <batching_pars_vertex>',
+        `#include <batching_pars_vertex>
+        uniform sampler2D uLerpTex;
+        uniform float uLerpTexW;
+        uniform float uNow;
+        vec4 _lerpTexel(int idx) {
+          int w = int(uLerpTexW);
+          return texelFetch(uLerpTex, ivec2(idx % w, idx / w), 0);
+        }`,
+      );
+      // After <batching_vertex> defines batchingMatrix, override its translation
+      // column with the GPU-lerped position when this instance has an active
+      // target (duration > 0). batchId = getIndirectIndex(gl_DrawID).
+      shader.vertexShader = shader.vertexShader.replace(
+        '#include <batching_vertex>',
+        `#include <batching_vertex>
+        #ifdef USE_BATCHING
+        {
+          int _bId = int(getIndirectIndex(gl_DrawID));
+          int _base = _bId * 2;
+          vec4 _p0 = _lerpTexel(_base);
+          vec4 _p1 = _lerpTexel(_base + 1);
+          float _dur = _p1.w;
+          if (_dur > 0.0) {
+            float _t = clamp((uNow - _p0.w) / _dur, 0.0, 1.0);
+            vec3 _lp = mix(_p0.xyz, _p1.xyz, _t);
+            batchingMatrix[3].xyz = _lp;
+          }
+        }
         #endif`,
       );
     };
@@ -170,12 +216,60 @@ export class BatchedFarTier {
     const id = this._instances.get(entity);
     if (id == null) return;
     this._instances.delete(entity);
+    this.clearLerp(id); // don't let a recycled instance id inherit stale motion
     this.mesh.deleteInstance(id);
+  }
+
+  // Instance id for an entity (used by the pool to target GPU lerp). -1 if none.
+  instanceIdFor(entity) {
+    const id = this._instances.get(entity);
+    return id == null ? -1 : id;
   }
 
   setMatrix(id, matrix) {
     if (id < 0) return;
     this.mesh.setMatrixAt(id, matrix);
+  }
+
+  // Allocate the per-instance lerp texture (RGBA32F, 2 texels/instance). texelFetch
+  // ignores filtering, but NearestFilter + no mipmaps avoids the float-linear GL
+  // error path. Square texture sized to hold maxInstances*2 texels.
+  _initLerpTexture(maxInstances) {
+    const texelCount = maxInstances * this._lerpTexelsPerInstance;
+    const w = Math.max(1, Math.ceil(Math.sqrt(texelCount)));
+    this._lerpTexW = w;
+    this._lerpData = new Float32Array(w * w * 4);
+    const tex = new THREE.DataTexture(this._lerpData, w, w, THREE.RGBAFormat, THREE.FloatType);
+    tex.minFilter = THREE.NearestFilter;
+    tex.magFilter = THREE.NearestFilter;
+    tex.generateMipmaps = false;
+    tex.needsUpdate = true;
+    this._lerpTex = tex;
+  }
+
+  // Push the per-frame clock to the shader (the ONLY per-frame CPU->GPU write
+  // for in-flight far entities). nowSec is a monotonic seconds value.
+  updateNow(nowSec) { this._uNow.value = nowSec; }
+
+  // Record a GPU lerp for instance `id`: interpolate translation pos0->pos1 over
+  // [startSec, startSec+durSec]. Writes 2 texels; the shader does the rest.
+  setLerpTarget(id, x0, y0, z0, x1, y1, z1, startSec, durSec) {
+    if (id < 0) return;
+    const base = id * this._lerpTexelsPerInstance * 4;
+    if (base + 7 >= this._lerpData.length) return; // out of range (pre-grow safety)
+    this._lerpData[base] = x0; this._lerpData[base + 1] = y0; this._lerpData[base + 2] = z0; this._lerpData[base + 3] = startSec;
+    this._lerpData[base + 4] = x1; this._lerpData[base + 5] = y1; this._lerpData[base + 6] = z1; this._lerpData[base + 7] = durSec;
+    this._lerpTex.needsUpdate = true;
+  }
+
+  // Clear any active lerp for an instance (duration=0 -> shader leaves the
+  // batching matrix translation as setMatrixAt set it). Used on release/recycle.
+  clearLerp(id) {
+    if (id < 0) return;
+    const base = id * this._lerpTexelsPerInstance * 4;
+    if (base + 7 >= this._lerpData.length) return;
+    for (let i = 0; i < 8; i++) this._lerpData[base + i] = 0;
+    this._lerpTex.needsUpdate = true;
   }
 
   // No-op stubs: BatchedMesh culls per instance itself from per-geometry bounds.
