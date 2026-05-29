@@ -19,9 +19,15 @@ import * as THREE from 'three';
 
 // Normalize a far geometry to the schema BatchedMesh requires (the schema is
 // frozen by the first geometry added, so every geometry must match exactly in
-// attribute set, itemSize and normalized flag). We force:
-//   position f32x3, normal f32x3, uv f32x2, color f32x4 (NON-normalized).
-// and strip everything else (uv1, tangent, the per-batch instanced attrs).
+// attribute set, itemSize and normalized flag). We force ONLY the attributes the
+// far material actually reads:
+//   position f32x3, color f32x4 (NON-normalized).
+// The far material is UNLIT MeshBasicMaterial with vertexColors and no map, so it
+// samples NEITHER normal NOR uv (no lighting math, no texture coords). Uploading
+// them was dead per-vertex fetch bandwidth + VRAM (~20 bytes/vertex) across the
+// dominant far tier, so we strip them along with everything else (uv1, tangent,
+// the per-batch instanced attrs). If the far material ever regains lighting or a
+// map, restore the attribute(s) it needs here.
 function _normalizeFarGeometry(src) {
   const pos = src.getAttribute('position');
   if (!pos) return null;
@@ -29,19 +35,6 @@ function _normalizeFarGeometry(src) {
   const geo = new THREE.BufferGeometry();
   // position
   geo.setAttribute('position', new THREE.BufferAttribute(_asFloat32(pos), 3, false));
-  // normal (compute if missing)
-  let nrm = src.getAttribute('normal');
-  if (nrm) {
-    geo.setAttribute('normal', new THREE.BufferAttribute(_asFloat32(nrm), 3, false));
-  } else {
-    geo.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(n * 3), 3, false));
-    geo.computeVertexNormals();
-  }
-  // uv (zero-fill if missing)
-  const uv = src.getAttribute('uv');
-  geo.setAttribute('uv', uv
-    ? new THREE.BufferAttribute(_asFloat32(uv, 2), 2, false)
-    : new THREE.BufferAttribute(new Float32Array(n * 2), 2, false));
   // color — unify to f32x4 non-normalized (matches the vertex-color gamma path).
   const col = src.getAttribute('color');
   geo.setAttribute('color', _colorToFloat4(col, n));

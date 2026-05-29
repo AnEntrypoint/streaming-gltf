@@ -33,7 +33,15 @@ import { fileURLToPath } from 'url';
 const PORT = process.env.PORT || 5180;
 // 127.0.0.1 (not "localhost"): under CHANNEL=chrome, Playwright's localhost
 // resolution intermittently stalls page.goto even though the server is up.
-const STRESS_URL = `http://127.0.0.1:${PORT}/stress.html`;
+// ?assets=local is MANDATORY for benchmarking: since the SDK-packaging commit
+// the demo defaults to streaming baked models CROSS-ORIGIN from the public host,
+// which never reaches instanced/BatchedMesh steady state within the warmup window
+// (far-LOD geometry never lands in geoCache, so every entity renders as its own
+// plain Mesh draw). ?assets=local streams from the dev server so the far tier
+// warms and we measure the real engine, not cold cross-origin streaming.
+// Override with ASSETS=<url|remote> if you specifically want to bench a host.
+const ASSETS = process.env.ASSETS || 'local';
+const STRESS_URL = `http://127.0.0.1:${PORT}/stress.html?assets=${encodeURIComponent(ASSETS)}`;
 // Args are entity counts, or the literal "all" to spawn every distinct model.
 const ARGS = process.argv.slice(2);
 const COUNTS = ARGS.map((a) => (a === 'all' ? 'all' : Number(a))).filter((n) => n === 'all' || n > 0);
@@ -45,7 +53,8 @@ const SAMPLE_GAP_MS = 100;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function measureOne(page, n) {
-  await page.goto(`${STRESS_URL}?cb=${Date.now()}`, { waitUntil: 'commit', timeout: 60000 });
+  // STRESS_URL already carries ?assets=…, so the cache-bust joins with '&'.
+  await page.goto(`${STRESS_URL}&cb=${Date.now()}`, { waitUntil: 'commit', timeout: 60000 });
   await page.waitForFunction(() => window.__pool && window.__pool.getStats, { timeout: 30000 });
   // n === 'all' clicks the spawn-all-distinct-models button; otherwise spawn the
   // requested count by clicking the closest data-n presets repeatedly.

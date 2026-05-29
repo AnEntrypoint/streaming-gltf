@@ -21,3 +21,8 @@ node_modules/
 
 # Generated FPS measurement output (run measure-fps.mjs to regenerate)
 examples/local-progressive/fps-measurement.json
+.gm/pw-sock-*/
+
+# Harness session dir + transient install lockfile (deps tracked via package.json)
+.claude/
+package-lock.json

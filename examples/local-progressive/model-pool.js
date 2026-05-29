@@ -1417,14 +1417,20 @@ class Entity extends Emitter {
     // auto-update on, or is flagged for one-shot rebuild).
     for (const tm of this.trackedMeshes) {
       if (tm._instancedSlot && tm._instancedSlotIdx >= 0) {
+        // Compute the slot's world matrix at most ONCE per frame: both the matrix
+        // push and the bound-sphere refresh below read the same transform, and
+        // _slotWorldMatrix does a matrix multiply (and, for non-fully-instanced
+        // meshes, an allocation) on every call. Cache it lazily here.
+        let slotWM = null;
         // Sub-pixel-culled entities keep their zeroed slot matrix — don't push
         // the real transform back (that would un-cull them every frame).
         if (!this._subPixelCulled && (movable || tm._matrixNeedsUpdate)) {
-          tm._instancedSlot.setMatrixForSlot(tm._instancedSlotIdx, this._slotWorldMatrix(tm));
+          slotWM = this._slotWorldMatrix(tm);
+          tm._instancedSlot.setMatrixForSlot(tm._instancedSlotIdx, slotWM);
           tm._matrixNeedsUpdate = false;
         }
         if (!this._subPixelCulled && movable && tm._instancedBoundRadius != null) {
-          const me = this._slotWorldMatrix(tm).elements;
+          const me = (slotWM || this._slotWorldMatrix(tm)).elements;
           const scale = this.root.scale.length() / Math.SQRT2;
           tm._instancedSlot.setBoundSphereForSlot(
             tm._instancedSlotIdx, me[12], me[13], me[14],
