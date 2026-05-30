@@ -9,7 +9,8 @@
   "exports": {
     ".": "./index.js",
     "./model-pool": "./examples/local-progressive/model-pool.js",
-    "./batched-far-tier": "./examples/local-progressive/batched-far-tier.js"
+    "./batched-far-tier": "./examples/local-progressive/batched-far-tier.js",
+    "./bake": "./tools/bake-progressive.mjs"
   },
   "files": [
     "index.js",
@@ -34,6 +35,14 @@
   "peerDependencies": {
     "three": ">= 0.160.0",
     "@pixiv/three-vrm": ">= 3.0.0"
+  },
+  "optionalDependencies": {
+    "@gltf-transform/core": "^4.3.0",
+    "@gltf-transform/extensions": "^4.3.0",
+    "@gltf-transform/functions": "^4.3.0",
+    "draco3dgltf": "^1.5.7",
+    "meshoptimizer": "^1.1.1",
+    "sharp": "^0.34.5"
   },
   "devDependencies": {
     "@gltf-transform/core": "^4.3.0",

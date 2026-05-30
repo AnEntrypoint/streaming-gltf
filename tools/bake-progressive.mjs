@@ -13,7 +13,7 @@ import draco3dgltf from 'draco3dgltf';
 import sharp from 'sharp';
 import { mkdir, writeFile, rm, stat, readFile } from 'node:fs/promises';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 // Read a GLB and return its JSON chunk as a parsed object plus the original
 // binary chunk bytes. Used to round-trip extensions gltf-transform doesn't
@@ -207,16 +207,6 @@ async function rewriteGlbJson(filePath, mutator) {
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..');
 
-const INPUT = process.argv[2] || path.join(repoRoot, 'model.glb');
-// Default output dir is named after the input basename so multiple models
-// can be baked into examples/local-progressive/ side by side.
-const inputBase = path.basename(INPUT, path.extname(INPUT));
-const DEFAULT_OUT = path.join(
-  repoRoot,
-  'examples/local-progressive',
-  inputBase === 'model' ? 'output' : `output_${inputBase}`,
-);
-const OUT_DIR = process.argv[3] || DEFAULT_OUT;
 const LODS_SUBDIR = 'lods';
 
 // LOD recipes from highest to lowest detail. Each entry: { ratio, kind }
@@ -232,7 +222,14 @@ const EXTRA_LOD_STAGES = [
 ];
 const TEX_LOD_SIZES = [2048, 1024, 512, 256, 128];
 
-async function main() {
+// Bake a single source GLB into the progressive LOD format consumed by
+// ModelPool: writes `<outDir>/model.progressive.glb` (lowest LOD inline + a
+// LOCAL_progressive extension) plus sibling LOD/texture files under
+// `<outDir>/lods/`. Exported so a server can bake on demand without shelling
+// out to the CLI; the CLI entry below is a thin wrapper around it.
+export async function bakeProgressive(INPUT, OUT_DIR) {
+  if (!INPUT) throw new Error('bakeProgressive: input path required');
+  if (!OUT_DIR) throw new Error('bakeProgressive: output dir required');
   console.log(`[bake] input  : ${INPUT}`);
   console.log(`[bake] output : ${OUT_DIR}`);
 
@@ -660,4 +657,16 @@ async function main() {
   console.log(`[bake] saving on initial load: ${(100 - (rootSize/origSize)*100).toFixed(1)}%`);
 }
 
-main().catch((e) => { console.error(e); process.exit(1); });
+// CLI entry: only run when invoked directly (`node tools/bake-progressive.mjs
+// <in> <out>`), not when imported for the on-demand server bake path.
+if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
+  const INPUT = process.argv[2] || path.join(repoRoot, 'model.glb');
+  const inputBase = path.basename(INPUT, path.extname(INPUT));
+  const DEFAULT_OUT = path.join(
+    repoRoot,
+    'examples/local-progressive',
+    inputBase === 'model' ? 'output' : `output_${inputBase}`,
+  );
+  const OUT_DIR = process.argv[3] || DEFAULT_OUT;
+  bakeProgressive(INPUT, OUT_DIR).catch((e) => { console.error(e); process.exit(1); });
+}
