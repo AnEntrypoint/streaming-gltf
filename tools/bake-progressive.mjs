@@ -204,6 +204,54 @@ async function rewriteGlbJson(filePath, mutator) {
   await writeFile(filePath, out);
 }
 
+// Normalize a GLB so @gltf-transform's reader can ingest it. The reader resolves
+// a texture's image via the top-level `texture.source`, but GLBs that use
+// EXT_texture_webp / EXT_texture_avif carry the image index ONLY under
+// `texture.extensions.<ext>.source` and may omit the top-level `source`. The
+// reader then maps a material's textureInfo to a null texture and throws
+// (`setTextureInfo` -> `setMagFilter` on null). We copy the extension's source
+// up to the top level (a valid glTF fallback) so the read succeeds; the webp
+// extension still carries its own source for extension-aware consumers. Returns
+// the path to a normalized temp GLB, or the original path if no change was
+// needed. Caller is responsible for cleaning up the temp file.
+async function normalizeForRead(filePath) {
+  const { json } = await readGlbParts(filePath);
+  const textures = json.textures || [];
+  const haveImage = (json.images || []).length > 0;
+  let changed = false;
+  for (const tex of textures) {
+    if (tex.source !== undefined) continue;
+    const extSource = tex.extensions?.EXT_texture_webp?.source
+      ?? tex.extensions?.EXT_texture_avif?.source
+      ?? tex.extensions?.KHR_texture_basisu?.source;
+    if (extSource !== undefined) {
+      tex.source = extSource;
+      changed = true;
+    } else if (haveImage) {
+      // A texture with NO image source anywhere (top-level or extension) makes
+      // the reader map a material's textureInfo to a null texture and throw.
+      // Point it at image 0 so the read succeeds; such a texture is already
+      // broken in the source asset, so the visual impact is nil.
+      tex.source = 0;
+      changed = true;
+    }
+  }
+  if (!changed) return filePath;
+  const tmpPath = filePath + '.normalized.glb';
+  // Copy the original then rewrite its JSON chunk in place with the patched defs.
+  await writeFile(tmpPath, await readFile(filePath));
+  await rewriteGlbJson(tmpPath, (j) => {
+    const t = j.textures || [];
+    for (let i = 0; i < t.length; i++) {
+      if (t[i].source === undefined && textures[i] && textures[i].source !== undefined) {
+        t[i].source = textures[i].source;
+      }
+    }
+  });
+  console.log(`[bake] normalized ${path.basename(filePath)}: populated top-level texture.source from texture extensions`);
+  return tmpPath;
+}
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..');
 
@@ -263,7 +311,13 @@ export async function bakeProgressive(INPUT, OUT_DIR) {
       'draco3d.decoder': await draco3dgltf.createDecoderModule(),
       'draco3d.encoder': await draco3dgltf.createEncoderModule(),
     });
-  const doc = await io.read(INPUT);
+  const readPath = await normalizeForRead(INPUT);
+  let doc;
+  try {
+    doc = await io.read(readPath);
+  } finally {
+    if (readPath !== INPUT) { try { await rm(readPath, { force: true }); } catch (_) {} }
+  }
   const root = doc.getRoot();
 
   console.log(`[bake] meshes=${root.listMeshes().length} textures=${root.listTextures().length}`);
@@ -454,6 +508,10 @@ export async function bakeProgressive(INPUT, OUT_DIR) {
           }
 
           const simp = cloneMesh.listPrimitives()[0];
+          // A primitive can be emptied/removed by aggressive simplification (or a
+          // degenerate source mesh). Skip the vertex-color bake for this LOD
+          // rather than crash the whole asset bake.
+          if (!simp) { console.warn(`[bake] mesh ${mi} prim ${pi}: no primitive after simplify, skipping LOD stage`); continue; }
           const posAcc = simp.getAttribute('POSITION');
           const uvAcc = simp.getAttribute('TEXCOORD_0');
           const vertCount = posAcc?.getCount() ?? 0;
