@@ -423,9 +423,20 @@ export async function bakeProgressive(INPUT, OUT_DIR) {
               let target = Math.min(FAR_TRI_CAP * 3, u32.length);
               target -= target % 3;
               target = Math.max(96, target); // >=32 tris
-              const res = MeshoptSimplifier.simplifySloppy(u32, f32, 3, null, target, 1e9);
-              const out = Array.isArray(res) ? res[0] : res;
-              idxAcc.setArray(out instanceof Uint32Array ? out : new Uint32Array(out));
+              // simplifySloppy asserts on some inputs (degenerate / tiny / non-
+              // manifold index buffers). The unskinned LOD is an optimization,
+              // not a correctness requirement: on failure keep the meshopt-
+              // decoded indices as-is (a heavier-but-correct far dot) rather
+              // than aborting the whole bake.
+              try {
+                const res = MeshoptSimplifier.simplifySloppy(u32, f32, 3, null, target, 1e9);
+                const out = Array.isArray(res) ? res[0] : res;
+                if (out && out.length >= 3) {
+                  idxAcc.setArray(out instanceof Uint32Array ? out : new Uint32Array(out));
+                }
+              } catch (e) {
+                console.warn(`[bake] simplifySloppy skipped for unskinned LOD (${u32.length / 3} tris): ${e.message}`);
+              }
             }
           } else {
             await cloneDoc.transform(
