@@ -1,6 +1,6 @@
 {
   "name": "streaming-gltf",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Streaming progressive glTF LOD renderer (BatchedMesh/InstancedMesh tiers, network-lazy GPU-eager LOD streaming, on-GPU position lerping) plus the local bake/convert + streaming-download pipeline (tools/bake-*.mjs).",
   "license": "MIT",
   "type": "module",
