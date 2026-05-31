@@ -879,6 +879,14 @@ class Entity extends Emitter {
           baseSkeleton: mesh.skeleton || null,
           parent: mesh.parent,
           texState: this.asset.texLodDescs.map(() => ({ currentLod: 0 })),
+          // Texture descriptors THIS mesh's material actually uses, by name.
+          // Without this scoping the per-frame LOD-driven _applyTexLod loop ran
+          // over ALL asset-wide descriptors (texState spans every texLodDesc),
+          // so a foreign descriptor's bitmap got stamped into this mesh's base
+          // map via the _findMaterialSlots fallback — the "texture changing on
+          // multi-texture objects after LOD switch" bug. Scoping to the mesh's
+          // own descriptors means foreign descriptors are never applied here.
+          _texDescIdxs: _meshTexDescIdxs(mesh.material, this.asset.texLodDescs),
           vcMaterial: null,
           _instancedSlot: null,
           _instancedSlotIdx: -1,
@@ -1401,7 +1409,14 @@ class Entity extends Emitter {
           // Use pre-computed texture LODs (only meaningful for the non-instanced,
           // textured tiers; instanced FAR uses vertex color, no textures).
           if (!tm._instancedSlot && this.pool._enableTextureLod && tm._precomputedTexLods) {
-            for (let ti = 0; ti < tm.texState.length; ti++) {
+            // Only this mesh's OWN texture descriptors — never foreign ones (see
+            // _texDescIdxs). Falls back to every descriptor when the per-mesh
+            // mapping came back empty (no name match), preserving prior behaviour
+            // for assets whose texture names don't resolve.
+            const idxs = (tm._texDescIdxs && tm._texDescIdxs.length)
+              ? tm._texDescIdxs
+              : tm.texState.map((_, i) => i);
+            for (const ti of idxs) {
               const tWant = tm._precomputedTexLods[ti];
               if (tWant != null && tWant !== tm.texState[ti].currentLod) {
                 this._applyTexLod(tm, ti, tWant);
@@ -1651,25 +1666,51 @@ function _precomputeAllTexLods(asset, screenPx) {
   return result;
 }
 
+const _MAT_TEX_SLOTS = ['map', 'normalMap', 'roughnessMap', 'metalnessMap', 'aoMap', 'emissiveMap'];
+
+// Which texLodDescs indices a material actually uses, by texture-name match.
+// Drives per-mesh _applyTexLod scoping so a mesh never has a foreign
+// descriptor's bitmap applied to it.
+function _meshTexDescIdxs(mat, texLodDescs) {
+  const idxs = [];
+  if (!mat || !texLodDescs) return idxs;
+  const names = new Set();
+  for (const slot of _MAT_TEX_SLOTS) {
+    const t = mat[slot];
+    if (t && t.name) names.add(t.name);
+  }
+  if (!names.size) return idxs;
+  for (let i = 0; i < texLodDescs.length; i++) {
+    const d = texLodDescs[i];
+    if (d && d.name && names.has(d.name)) idxs.push(i);
+  }
+  return idxs;
+}
+
 // Same texture-slot resolver as the inline demo.
 function _findMaterialSlots(mat, texEntry) {
   if (!mat) return [];
-  const slots = ['map', 'normalMap', 'roughnessMap', 'metalnessMap', 'aoMap', 'emissiveMap'];
   const out = new Set();
-  for (const slot of slots) {
+  for (const slot of _MAT_TEX_SLOTS) {
     const t = mat[slot];
     if (!t) continue;
     const tname = t.name || '';
     if (tname && texEntry.name && tname === texEntry.name) out.add(t);
   }
   if (out.size) return [...out];
+  // Heuristic name-keyword match for assets whose texture names don't equal the
+  // descriptor name exactly. NOTE: there is deliberately NO `mat.map` catch-all
+  // here. The old `if (!out.size && mat.map) out.add(mat.map)` fallback stamped
+  // ANY descriptor's bitmap into the base-colour map, which is what cross-wrote
+  // the wrong texture onto multi-texture meshes on every LOD switch. Returning
+  // empty (no write) is correct: a descriptor that matches nothing on this
+  // material must not touch it.
   const nm = (texEntry.name || '').toLowerCase();
   if (nm.includes('normal') && mat.normalMap) out.add(mat.normalMap);
   if ((nm.includes('metallic') || nm.includes('roughness'))) {
     if (mat.roughnessMap) out.add(mat.roughnessMap);
     if (mat.metalnessMap) out.add(mat.metalnessMap);
   }
-  if (!out.size && mat.map) out.add(mat.map);
   return [...out];
 }
 
