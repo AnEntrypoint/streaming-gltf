@@ -35,6 +35,38 @@ pool.update();
 pool.setTarget(entity, x, y, z, durationMs);
 ```
 
+## VRM support
+
+VRM avatars load through `@pixiv/three-vrm` v3 (a peer dependency). When a baked
+GLB carries the `VRMC_vrm` extension, the `GLTFLoader` is registered with
+`VRMLoaderPlugin` and the parsed `gltf.userData.vrm` runtime is driven each frame
+by `pool.update()` — humanoid bones, spring bones, expressions, and look-at all
+animate. The HUD in the example reports the detected humanoid bone count.
+
+What works:
+
+- Full humanoid / spring-bone / expression / look-at runtime on a VRM avatar.
+- Progressive mesh + texture LOD on the avatar's primitives, exactly as for any
+  other model. Sibling LOD chunks are loaded **without** the VRM plugin
+  (`includeVrm: false`), so MToon material setup runs once on the root only.
+- MToon materials are LOD-swapped safely: texture-LOD application matches strictly
+  by texture name against the material's existing slots, so it never stamps a
+  foreign bitmap into an MToon slot.
+
+Known limit — one driven instance per VRM asset. `@pixiv/three-vrm` v3 exposes no
+skeleton-rebind clone (`VRM.prototype` is `[constructor, update]` only; there is
+no `vrm.clone()` / `VRMUtils.clone`), and its humanoid/spring-bone/expression
+managers bind to the **original** loaded scene's bones. The pool therefore lets at
+most one live entity own and drive the VRM runtime per asset — that entity renders
+the original scene so `vrm.update()` animates what is on screen. Any **additional**
+pooled instances of the same VRM render a static bind-pose clone (shared geometry,
+no per-instance spring physics). Ownership is released on `entity.dispose()`, so a
+surviving sibling can claim it. For many independently-animating copies of one VRM,
+load it once per instance rather than pooling clones.
+
+`pool.dispose()` tears the pool down (every entity, then every asset); each
+asset's `dispose()` calls `VRMUtils.deepDispose()` to free the VRM runtime.
+
 ## Layout
 
 - `examples/local-progressive/` — the renderer (latest). Entry: `stress.html` →

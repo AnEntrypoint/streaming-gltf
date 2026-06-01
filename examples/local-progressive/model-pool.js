@@ -21,7 +21,7 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
 import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
-import { VRMLoaderPlugin } from '@pixiv/three-vrm';
+import { VRMLoaderPlugin, VRMUtils } from '@pixiv/three-vrm';
 import { GlobalMaterialPool } from './material-pool.js';
 import { DeferredLoadQueue } from './deferred-load-queue.js';
 import { LodUnloadManager } from './lod-unload-manager.js';
@@ -400,9 +400,12 @@ class Asset {
     // The original gltf payload from the root load — used to clone scenes
     // per-entity. Held as the parsed three.js Object3D plus parser.json.
     this.rootGltf = null;
-    // VRM extension blob (if present) so spawned entities can re-bind to a
-    // matching three-vrm runtime per entity.
+    // VRM extension blob (if present). Because three-vrm v3 has no
+    // skeleton-rebind clone, at most ONE live entity can own + drive the VRM
+    // runtime at a time; _vrmOwner points at that entity (or null when the VRM
+    // is unowned and the next spawn may claim it).
     this.hasVRM = false;
+    this._vrmOwner = null;
     // Track bytes-loaded per LOD for the budget system in Phase C.
     this.byteWeights = new Map(); // key -> bytes
     // Loaders need to know whether this asset is VRM-bearing (root) or a
@@ -626,6 +629,25 @@ class Asset {
     this.byteWeights.delete(`tex:${key}`);
     return true;
   }
+
+  // Full teardown of the shared root payload. Per-entity dispose() never
+  // touches this (entities share rootGltf); call this only when the asset
+  // itself is being evicted from the pool. VRMUtils.deepDispose releases the
+  // VRM springbone/collider/expression managers and their GPU resources.
+  dispose() {
+    const vrm = this.rootGltf?.userData?.vrm;
+    if (vrm) {
+      try { VRMUtils.deepDispose(this.rootGltf.scene); } catch (e) { /* best-effort */ }
+    }
+    for (const geo of this.geoCache.values()) geo?.dispose?.();
+    for (const bmp of this.texCache.values()) bmp?.close?.();
+    this.geoCache.clear();
+    this.texCache.clear();
+    this.byteWeights.clear();
+    this._vrmOwner = null;
+    this.rootGltf = null;
+    this.state = 'disposed';
+  }
 }
 
 // Repack interleaved attributes into standalone Float32 and bake the source
@@ -846,12 +868,28 @@ class Entity extends Emitter {
     try {
       await this.asset.ready;
       if (this._disposed) return;
-      // Clone the root gltf scene per-entity so each has its own skeleton +
-      // mesh objects (geometries are shared via the asset cache).
-      const sourceScene = this.asset.rootGltf.scene;
-      const cloned = _cloneSkinned(sourceScene);
-      // Find the cloned VRM if present.
-      this.vrm = this.asset.rootGltf.userData?.vrm || null;
+      // VRM ownership: @pixiv/three-vrm v3 exposes NO skeleton-rebind clone
+      // (VRM.prototype = [constructor, update] only; no VRMUtils.clone). Its
+      // humanoid/springBone/expression managers bind to the ORIGINAL source
+      // scene's bones, so a _cloneSkinned copy cannot be driven by the shared
+      // VRM runtime. We therefore let exactly one live entity per VRM-bearing
+      // asset OWN the VRM: that entity renders the original gltf.scene (so
+      // vrm.update animates what is actually on screen), and every other
+      // pooled instance renders a bind-pose clone with this.vrm = null.
+      const srcVrm = this.asset.rootGltf.userData?.vrm || null;
+      const canOwnVrm = !!srcVrm && this.asset._vrmOwner == null;
+      let cloned;
+      if (canOwnVrm) {
+        // Take ownership: use the original (un-cloned) scene + drive the VRM.
+        this.asset._vrmOwner = this;
+        this.vrm = srcVrm;
+        cloned = this.asset.rootGltf.scene;
+      } else {
+        // Either no VRM, or the VRM is already owned by another live entity —
+        // render a bind-pose clone with no per-instance VRM runtime.
+        cloned = _cloneSkinned(this.asset.rootGltf.scene);
+        this.vrm = null;
+      }
       this.root.add(cloned);
       // Compose world matrices so we can capture each mesh node's transform
       // RELATIVE to the entity root (root.matrixWorld⁻¹ × mesh.matrixWorld).
@@ -1535,6 +1573,13 @@ class Entity extends Emitter {
     if (this.animationAction) this.animationAction.stop();
     this.animationMixer = null;
     this.animationAction = null;
+    // Release VRM ownership if we held it. The VRM runtime belongs to the
+    // shared asset.rootGltf (its managers bind the source-scene bones), so we
+    // must NOT deepDispose it here — that would destroy the asset other
+    // entities still clone from. We only drop our reference and free the
+    // ownership slot so a surviving sibling instance can claim + drive it.
+    if (this.asset._vrmOwner === this) this.asset._vrmOwner = null;
+    this.vrm = null;
     // Release any instanced-mesh slots we held.
     for (const tm of this.trackedMeshes) {
       if (tm._instancedSlot) tm._instancedSlot.releaseSlot(this);
@@ -3003,5 +3048,14 @@ export class ModelPool extends Emitter {
         this._runTask(this._pending.shift());
       }
     }
+  }
+
+  // Tear the whole pool down: dispose every live entity, then every shared
+  // asset (which deepDisposes any VRM runtime and frees cached GPU buffers).
+  dispose() {
+    for (const e of [...this._entities]) e.dispose();
+    for (const asset of this._assets.values()) asset.dispose();
+    this._assets.clear();
+    this._loadQueue.clear();
   }
 }
