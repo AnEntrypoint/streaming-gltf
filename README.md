@@ -46,7 +46,7 @@ pool.setTarget(entity, x, y, z, durationMs);
   steady-state FPS harness.
 - `tools/` — the conversion + download pipeline:
   - `bake-progressive.mjs` — convert one source GLB into a progressive GLB
-    (meshopt decimation + sharp texture resizing + a `LOCAL_progressive`
+    (meshopt decimation + sharp texture resizing + a `COAS_progressive_lod`
     extension referencing sibling LOD files).
   - `bake-all.mjs` — batch-bake every model under a source dir.
   - `bake-streaming.mjs` — download + bake for the streaming workflow.
@@ -81,6 +81,27 @@ Measure steady-state FPS (hardware GPU via system Chrome):
 ```
 CHANNEL=chrome npm run measure -- 500
 ```
+
+## glTF extension: `COAS_progressive_lod`
+
+The bake pipeline emits a glTF extension, **`COAS_progressive_lod`**, that
+declares the progressive LOD ladder (per-mesh and per-texture) the renderer
+consumes. The base glTF always carries the *coarsest* LOD, and the extension is
+declared in `extensionsUsed` — never `extensionsRequired` — so a viewer that
+does not implement it simply renders that coarse base and ignores the rest. Two
+storage modes are covered by one extension, discriminated by a `storage` field:
+`sibling-file` (higher LODs in sibling files, `bake-progressive.mjs`) and
+`single-glb-range` (all LODs packed as `bufferView` byte ranges in one GLB,
+range-fetched on demand, `bake-streaming.mjs`).
+
+- Spec + JSON Schema: [`extensions/COAS_progressive_lod/`](extensions/COAS_progressive_lod/README.md)
+- Conformance check: `node tools/validate-extension.mjs <model.glb>`
+
+**Registration status:** the `COAS` vendor prefix is *not yet registered* with
+the Khronos glTF extension registry; the name is provisional until a
+registration PR to [KhronosGroup/glTF](https://github.com/KhronosGroup/glTF)
+lands. Assets baked before the rename (payload under `extras.LOCAL_progressive`)
+are still read by the runtime via a compatibility fallback.
 
 ## Notes
 

@@ -2,8 +2,8 @@
 // Phase 2 streaming baker.
 // Produces a single model.streaming.glb whose binary chunk packs every LOD
 // (mesh attributes + texture images) as independent regions referenced by
-// glTF bufferViews. The default scene displays the lowest LOD; an extras
-// payload `LOCAL_streaming` maps each (meshIndex, primIndex, lodLevel) to
+// glTF bufferViews. The default scene displays the lowest LOD; the
+// extensions[COAS_progressive_lod] payload maps each (meshIndex, primIndex, lodLevel) to
 // the exact bufferView indices for indices/POSITION/NORMAL/UV/etc., and
 // each texture LOD to a bufferView.
 //
@@ -341,10 +341,14 @@ async function main() {
   // Textures array index map remains as in source; ensure each texture entry references the corresponding image index.
   finalJson.textures = (finalJson.textures || []).map((t, i) => ({ ...t, source: i }));
 
-  // Attach the streaming descriptor.
-  finalJson.extras = finalJson.extras || {};
-  finalJson.extras.LOCAL_streaming = {
+  // Attach the streaming descriptor as a conformant glTF extension.
+  // Declared in extensionsUsed (never required) so a viewer without the
+  // extension still renders the lowest-LOD base the primitives point at.
+  finalJson.extensions = finalJson.extensions || {};
+  finalJson.extensionsUsed = [...new Set([...(finalJson.extensionsUsed || []), 'COAS_progressive_lod'])];
+  finalJson.extensions.COAS_progressive_lod = {
     version: 1,
+    storage: 'single-glb-range',
     meshes: lodMap.map((rec) => ({
       meshIndex: rec.meshIndex,
       primIndex: rec.primIndex,

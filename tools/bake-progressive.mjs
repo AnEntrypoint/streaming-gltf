@@ -2,7 +2,7 @@
 // Local progressive LOD baker.
 // Takes a GLB, decimates each primitive at multiple ratios using meshoptimizer,
 // resizes each texture at multiple sizes via sharp,
-// writes a small root GLB carrying the lowest LOD inline plus a LOCAL_progressive
+// writes a small root GLB carrying the lowest LOD inline plus a COAS_progressive_lod
 // extension JSON that references sibling .glb / .webp files for higher LODs.
 
 import { NodeIO } from '@gltf-transform/core';
@@ -272,7 +272,7 @@ const TEX_LOD_SIZES = [2048, 1024, 512, 256, 128];
 
 // Bake a single source GLB into the progressive LOD format consumed by
 // ModelPool: writes `<outDir>/model.progressive.glb` (lowest LOD inline + a
-// LOCAL_progressive extension) plus sibling LOD/texture files under
+// COAS_progressive_lod extension) plus sibling LOD/texture files under
 // `<outDir>/lods/`. Exported so a server can bake on demand without shelling
 // out to the CLI; the CLI entry below is a thin wrapper around it.
 export async function bakeProgressive(INPUT, OUT_DIR) {
@@ -619,9 +619,10 @@ export async function bakeProgressive(INPUT, OUT_DIR) {
 
   // Stage 3: build the root GLB.
   // Strategy: start from the original doc, swap in lowest-LOD geometry per primitive,
-  // swap in the smallest texture variant, then attach a top-level LOCAL_progressive
-  // extras blob (we use `extras` rather than a registered extension to avoid
-  // GLTFLoader rejecting unknown extensionsRequired).
+  // swap in the smallest texture variant, then attach a top-level
+  // COAS_progressive_lod extension (spliced into extensions[] in the JSON
+  // post-pass below; declared in extensionsUsed, never extensionsRequired, so
+  // GLTFLoader still loads the base LOD without implementing the extension).
   const rootDoc = cloneDocument(doc);
   const rootRoot = rootDoc.getRoot();
 
@@ -666,6 +667,7 @@ export async function bakeProgressive(INPUT, OUT_DIR) {
   // Per-primitive density = indexCount / triangle_count_in_world_space_isn't_available_at_bake → use baseline triangle count as proxy.
   const extPayload = {
     version: 1,
+    storage: 'sibling-file',
     meshes: meshLODs.map((ml) => ({
       meshIndex: ml.meshIndex,
       primIndex: ml.primIndex,
@@ -695,7 +697,11 @@ export async function bakeProgressive(INPUT, OUT_DIR) {
     })),
   };
 
-  rootRoot.setExtras({ ...rootRoot.getExtras(), LOCAL_progressive: extPayload });
+  // The payload is spliced into extensions[COAS_progressive_lod] in the JSON
+  // post-pass below (gltf-transform's writer has no Extension class for our
+  // name, so it would drop a setExtension here). Declared in extensionsUsed —
+  // never extensionsRequired — so a viewer without the extension still renders
+  // the inline base LOD.
 
   // Drop orphaned accessors/bufferviews left over after swapping in the lowest LOD geometry.
   await rootDoc.transform(prune(), dedup());
@@ -704,20 +710,19 @@ export async function bakeProgressive(INPUT, OUT_DIR) {
   const rootOut = path.join(OUT_DIR, 'model.progressive.glb');
   await writeFile(rootOut, rootBin);
 
-  // Splice the preserved passthrough extensions (VRM etc.) back into the
-  // root GLB's JSON chunk. gltf-transform's writer doesn't know about them
-  // so it would have dropped them during the round-trip.
-  if (Object.keys(passthroughBlob).length) {
-    await rewriteGlbJson(rootOut, (j) => {
-      j.extensions = { ...(j.extensions || {}), ...passthroughBlob };
-      const used = new Set([...(j.extensionsUsed || []), ...sourceExtensionsUsed]);
-      j.extensionsUsed = [...used];
-      if (sourceExtensionsRequired.length) {
-        const req = new Set([...(j.extensionsRequired || []), ...sourceExtensionsRequired]);
-        j.extensionsRequired = [...req];
-      }
-    });
-  }
+  // Splice the COAS_progressive_lod extension payload — plus any preserved
+  // passthrough extensions (VRM etc.) — back into the root GLB's JSON chunk.
+  // gltf-transform's writer doesn't know about these so it would have dropped
+  // them during the round-trip.
+  await rewriteGlbJson(rootOut, (j) => {
+    j.extensions = { ...(j.extensions || {}), ...passthroughBlob, COAS_progressive_lod: extPayload };
+    const used = new Set([...(j.extensionsUsed || []), ...sourceExtensionsUsed, 'COAS_progressive_lod']);
+    j.extensionsUsed = [...used];
+    if (sourceExtensionsRequired.length) {
+      const req = new Set([...(j.extensionsRequired || []), ...sourceExtensionsRequired]);
+      j.extensionsRequired = [...req];
+    }
+  });
   const rootSize = (await stat(rootOut)).size;
   const origSize = (await stat(INPUT)).size;
   console.log(`\n[bake] root: ${rootOut}`);

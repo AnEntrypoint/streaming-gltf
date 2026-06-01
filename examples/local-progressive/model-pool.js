@@ -2,7 +2,8 @@
 //
 // Responsibilities:
 //  - Load a baked progressive asset bundle (root GLB + sibling LOD files +
-//    LOCAL_progressive extras blob) at most ONCE per source URL.
+//    the extensions.COAS_progressive_lod payload, legacy extras.LOCAL_progressive
+//    still read as a fallback) at most ONCE per source URL.
 //  - Share BufferGeometry and Texture instances across every Entity that
 //    spawns from the same asset, so 1000 LANMOWERs reuse one geometry per LOD
 //    rather than allocating 1000 copies.
@@ -388,7 +389,7 @@ class Asset {
     // baseDir is the directory of the root model.progressive.glb so we can
     // resolve sibling LOD relative paths against it.
     this.baseDir = url.endsWith('/') ? url : url.replace(/[^/]+$/, '');
-    // Per-mesh LOD descriptors from the LOCAL_progressive extras blob, sorted
+    // Per-mesh LOD descriptors from the COAS_progressive_lod payload, sorted
     // by quality ascending (idx 0 = lowest, idx N-1 = highest).
     this.meshLodDescs = []; // [{ meshIndex, primIndex, lods: [...] }]
     this.texLodDescs = []; // [{ textureIndex, name, lods: [...] }]
@@ -429,7 +430,11 @@ class Asset {
       });
       this.rootGltf = gltf;
       this.hasVRM = !!gltf.userData?.vrm;
-      const ext = gltf.parser.json?.extras?.LOCAL_progressive;
+      // Prefer the conformant extensions[COAS_progressive_lod] payload; fall
+      // back to the legacy extras.LOCAL_progressive blob so assets baked before
+      // the extension rename still load.
+      const json = gltf.parser.json;
+      const ext = json?.extensions?.COAS_progressive_lod ?? json?.extras?.LOCAL_progressive;
       if (ext) {
         const kindRank = { unskinned: 0, vertcolor: 1, textured: 2 };
         for (const m of ext.meshes) {
