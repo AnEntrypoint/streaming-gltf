@@ -1,13 +1,13 @@
-# COAS_progressive_lod
+# EP_progressive_lod
 
 ## Contributors
 
-- COAS (https://coas.co.za)
+- lanmower (https://github.com/lanmower)
 
 ## Status
 
 Draft. This extension is **not yet registered** with the Khronos glTF extension
-registry. The vendor prefix `COAS` must be reserved via a pull request to
+registry. The vendor prefix `EP` must be reserved via a pull request to
 [KhronosGroup/glTF](https://github.com/KhronosGroup/glTF) before this can be
 considered an official extension; until then the name is provisional and the
 extension MUST be treated as vendor-private.
@@ -18,7 +18,7 @@ Written against the glTF 2.0 specification.
 
 ## Overview
 
-`COAS_progressive_lod` declares a set of progressively-refinable level-of-detail
+`EP_progressive_lod` declares a set of progressively-refinable level-of-detail
 (LOD) representations for the meshes and textures of a glTF asset, so a client
 can render a coarse representation immediately and refine it lazily as bandwidth
 and on-screen size warrant — without downloading the full-detail asset up front.
@@ -47,9 +47,9 @@ The extension is added to the top-level (document root) `extensions` object:
 
 ```json
 {
-  "extensionsUsed": ["COAS_progressive_lod"],
+  "extensionsUsed": ["EP_progressive_lod"],
   "extensions": {
-    "COAS_progressive_lod": {
+    "EP_progressive_lod": {
       "version": 1,
       "storage": "sibling-file",
       "meshes": [

@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "COAS_progressive_lod texture descriptor",
+  "title": "EP_progressive_lod texture descriptor",
   "type": "object",
   "description": "Per-texture set of resolution LOD variants, ordered small-to-large by the client after load.",
   "properties": {

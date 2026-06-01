@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "COAS_progressive_lod mesh descriptor",
+  "title": "EP_progressive_lod mesh descriptor",
   "type": "object",
   "description": "Per-primitive set of LOD variants, ordered coarse-to-fine by the client after load.",
   "properties": {
@@ -17,7 +17,7 @@
     "lods": {
       "type": "array",
       "minItems": 1,
-      "items": { "$ref": "lod.COAS_progressive_lod.schema.json" }
+      "items": { "$ref": "lod.EP_progressive_lod.schema.json" }
     }
   },
   "required": ["meshIndex", "primIndex", "lods"],

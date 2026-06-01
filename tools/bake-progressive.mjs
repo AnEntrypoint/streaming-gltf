@@ -2,7 +2,7 @@
 // Local progressive LOD baker.
 // Takes a GLB, decimates each primitive at multiple ratios using meshoptimizer,
 // resizes each texture at multiple sizes via sharp,
-// writes a small root GLB carrying the lowest LOD inline plus a COAS_progressive_lod
+// writes a small root GLB carrying the lowest LOD inline plus a EP_progressive_lod
 // extension JSON that references sibling .glb / .webp files for higher LODs.
 
 import { NodeIO } from '@gltf-transform/core';
@@ -272,7 +272,7 @@ const TEX_LOD_SIZES = [2048, 1024, 512, 256, 128];
 
 // Bake a single source GLB into the progressive LOD format consumed by
 // ModelPool: writes `<outDir>/model.progressive.glb` (lowest LOD inline + a
-// COAS_progressive_lod extension) plus sibling LOD/texture files under
+// EP_progressive_lod extension) plus sibling LOD/texture files under
 // `<outDir>/lods/`. Exported so a server can bake on demand without shelling
 // out to the CLI; the CLI entry below is a thin wrapper around it.
 export async function bakeProgressive(INPUT, OUT_DIR) {
@@ -620,7 +620,7 @@ export async function bakeProgressive(INPUT, OUT_DIR) {
   // Stage 3: build the root GLB.
   // Strategy: start from the original doc, swap in lowest-LOD geometry per primitive,
   // swap in the smallest texture variant, then attach a top-level
-  // COAS_progressive_lod extension (spliced into extensions[] in the JSON
+  // EP_progressive_lod extension (spliced into extensions[] in the JSON
   // post-pass below; declared in extensionsUsed, never extensionsRequired, so
   // GLTFLoader still loads the base LOD without implementing the extension).
   const rootDoc = cloneDocument(doc);
@@ -697,7 +697,7 @@ export async function bakeProgressive(INPUT, OUT_DIR) {
     })),
   };
 
-  // The payload is spliced into extensions[COAS_progressive_lod] in the JSON
+  // The payload is spliced into extensions[EP_progressive_lod] in the JSON
   // post-pass below (gltf-transform's writer has no Extension class for our
   // name, so it would drop a setExtension here). Declared in extensionsUsed —
   // never extensionsRequired — so a viewer without the extension still renders
@@ -710,13 +710,13 @@ export async function bakeProgressive(INPUT, OUT_DIR) {
   const rootOut = path.join(OUT_DIR, 'model.progressive.glb');
   await writeFile(rootOut, rootBin);
 
-  // Splice the COAS_progressive_lod extension payload — plus any preserved
+  // Splice the EP_progressive_lod extension payload — plus any preserved
   // passthrough extensions (VRM etc.) — back into the root GLB's JSON chunk.
   // gltf-transform's writer doesn't know about these so it would have dropped
   // them during the round-trip.
   await rewriteGlbJson(rootOut, (j) => {
-    j.extensions = { ...(j.extensions || {}), ...passthroughBlob, COAS_progressive_lod: extPayload };
-    const used = new Set([...(j.extensionsUsed || []), ...sourceExtensionsUsed, 'COAS_progressive_lod']);
+    j.extensions = { ...(j.extensions || {}), ...passthroughBlob, EP_progressive_lod: extPayload };
+    const used = new Set([...(j.extensionsUsed || []), ...sourceExtensionsUsed, 'EP_progressive_lod']);
     j.extensionsUsed = [...used];
     if (sourceExtensionsRequired.length) {
       const req = new Set([...(j.extensionsRequired || []), ...sourceExtensionsRequired]);

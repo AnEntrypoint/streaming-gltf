@@ -1,12 +1,12 @@
 #!/usr/bin/env node
-// Conformance validator for the COAS_progressive_lod glTF extension.
+// Conformance validator for the EP_progressive_lod glTF extension.
 //
 // Usage:
 //   node tools/validate-extension.mjs <model.glb>
 //
-// Reads the GLB's JSON chunk, locates extensions.COAS_progressive_lod (or the
+// Reads the GLB's JSON chunk, locates extensions.EP_progressive_lod (or the
 // legacy extras.LOCAL_progressive fallback), and validates it against the JSON
-// Schema under extensions/COAS_progressive_lod/schema/. If `ajv` is installed
+// Schema under extensions/EP_progressive_lod/schema/. If `ajv` is installed
 // it is used for full draft-07 validation; otherwise the tool falls back to a
 // dependency-free structural check so it still runs in a bare checkout.
 //
@@ -18,7 +18,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..');
-const SCHEMA_DIR = path.join(repoRoot, 'extensions/COAS_progressive_lod/schema');
+const SCHEMA_DIR = path.join(repoRoot, 'extensions/EP_progressive_lod/schema');
 
 function extractGlbJson(glb) {
   const dv = new DataView(glb.buffer, glb.byteOffset, glb.byteLength);
@@ -31,10 +31,10 @@ function extractGlbJson(glb) {
 
 async function loadSchemas() {
   const names = [
-    'glTF.COAS_progressive_lod.schema.json',
-    'mesh.COAS_progressive_lod.schema.json',
-    'texture.COAS_progressive_lod.schema.json',
-    'lod.COAS_progressive_lod.schema.json',
+    'glTF.EP_progressive_lod.schema.json',
+    'mesh.EP_progressive_lod.schema.json',
+    'texture.EP_progressive_lod.schema.json',
+    'lod.EP_progressive_lod.schema.json',
   ];
   const schemas = {};
   for (const n of names) {
@@ -53,9 +53,9 @@ async function tryAjv(schemas, payload) {
   const ajv = new Ajv({ allErrors: true, strict: false });
   // Register sub-schemas under their $ref filenames.
   for (const [name, schema] of Object.entries(schemas)) {
-    if (name !== 'glTF.COAS_progressive_lod.schema.json') ajv.addSchema(schema, name);
+    if (name !== 'glTF.EP_progressive_lod.schema.json') ajv.addSchema(schema, name);
   }
-  const validate = ajv.compile(schemas['glTF.COAS_progressive_lod.schema.json']);
+  const validate = ajv.compile(schemas['glTF.EP_progressive_lod.schema.json']);
   const ok = validate(payload);
   return { ok, errors: validate.errors || [] };
 }
@@ -92,15 +92,15 @@ async function main() {
   }
   const glb = new Uint8Array(await readFile(input));
   const json = extractGlbJson(glb);
-  const payload = json.extensions?.COAS_progressive_lod ?? json.extras?.LOCAL_progressive;
+  const payload = json.extensions?.EP_progressive_lod ?? json.extras?.LOCAL_progressive;
   if (!payload) {
-    console.error(`[validate] no COAS_progressive_lod payload found in ${input}`);
+    console.error(`[validate] no EP_progressive_lod payload found in ${input}`);
     process.exit(1);
   }
-  const legacy = !json.extensions?.COAS_progressive_lod;
-  if (legacy) console.warn('[validate] WARNING: payload found under legacy extras.LOCAL_progressive — re-bake to emit extensions.COAS_progressive_lod');
-  if (!legacy && !(json.extensionsUsed || []).includes('COAS_progressive_lod')) {
-    console.warn('[validate] WARNING: COAS_progressive_lod not declared in extensionsUsed');
+  const legacy = !json.extensions?.EP_progressive_lod;
+  if (legacy) console.warn('[validate] WARNING: payload found under legacy extras.LOCAL_progressive — re-bake to emit extensions.EP_progressive_lod');
+  if (!legacy && !(json.extensionsUsed || []).includes('EP_progressive_lod')) {
+    console.warn('[validate] WARNING: EP_progressive_lod not declared in extensionsUsed');
   }
 
   const schemas = await loadSchemas();
@@ -109,7 +109,7 @@ async function main() {
   if (!result) result = structuralCheck(payload);
 
   if (result.ok) {
-    console.log(`[validate] OK — ${input} conforms to COAS_progressive_lod [${mode}, storage=${payload.storage}]`);
+    console.log(`[validate] OK — ${input} conforms to EP_progressive_lod [${mode}, storage=${payload.storage}]`);
     process.exit(0);
   }
   console.error(`[validate] FAIL — ${input} [${mode}]`);

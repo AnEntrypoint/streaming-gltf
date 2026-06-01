@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "COAS_progressive_lod mesh LOD entry",
+  "title": "EP_progressive_lod mesh LOD entry",
   "type": "object",
   "description": "One level-of-detail variant of a mesh primitive. Either sibling-file (inline/path) or single-glb-range (bufferView) form, depending on the extension's storage mode.",
   "properties": {
