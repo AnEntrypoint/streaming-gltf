@@ -1589,7 +1589,11 @@ class Entity extends Emitter {
         this.animationMixer.update(dt);
       }
     }
-    if (this.vrm?.update && dist < animationThrottleDistance && !anyInstanced) this.vrm.update(dt);
+    // opts.driveVrm === false lets the HOST own vrm.update(dt) — e.g. a game
+    // that runs its own animator/expression/look-at pipeline on entity.vrm and
+    // would otherwise double-drive it. When the host drives, the pool also skips
+    // the close-range throttle gate (the host decides its own update cadence).
+    if (this.vrm?.update && this.opts.driveVrm !== false && dist < animationThrottleDistance && !anyInstanced) this.vrm.update(dt);
     // Return distance and screenPx for tier allocation by the pool. The result
     // is read synchronously by the pool before the next _update call, so a
     // single reused object avoids a per-entity allocation in the hot path.

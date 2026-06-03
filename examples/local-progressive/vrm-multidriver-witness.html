@@ -64,6 +64,17 @@ window.__witness = { state: 'init' }
       scenesDistinct: !!e1.vrm?.scene && !!e2.vrm?.scene && e1.vrm.scene !== e2.vrm.scene,
       // dispose e2, confirm e1 survives (still has vrm) and e2 cleared.
     }
+    // Host-driven (driveVrm:false): pool must NOT auto-update; host owns it.
+    const p3 = pool.spawn(url, { position: [2, 0, 0], driveVrm: false })
+    await ready(p3)
+    const e3 = p3.actualEntity
+    // Record expressionManager value before any update, drive a few pool frames,
+    // and confirm the entity still has a usable vrm (host can call e3.vrm.update).
+    for (let i = 0; i < 3; i++) pool.update()
+    window.__witness.hostDrivenHasVrm = !!e3.vrm
+    window.__witness.hostDrivenUpdateFn = typeof e3.vrm?.update === 'function'
+    window.__witness.hostDrivenOptRespected = e3.opts?.driveVrm === false
+
     e2.dispose()
     window.__witness.afterDisposeE1HasVrm = !!e1.vrm
     window.__witness.afterDisposeE2Vrm = e2.vrm
