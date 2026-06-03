@@ -53,19 +53,21 @@ What works:
   by texture name against the material's existing slots, so it never stamps a
   foreign bitmap into an MToon slot.
 
-Known limit — one driven instance per VRM asset. `@pixiv/three-vrm` v3 exposes no
-skeleton-rebind clone (`VRM.prototype` is `[constructor, update]` only; there is
-no `vrm.clone()` / `VRMUtils.clone`), and its humanoid/spring-bone/expression
-managers bind to the **original** loaded scene's bones. The pool therefore lets at
-most one live entity own and drive the VRM runtime per asset — that entity renders
-the original scene so `vrm.update()` animates what is on screen. Any **additional**
-pooled instances of the same VRM render a static bind-pose clone (shared geometry,
-no per-instance spring physics). Ownership is released on `entity.dispose()`, so a
-surviving sibling can claim it. For many independently-animating copies of one VRM,
-load it once per instance rather than pooling clones.
+Multi-driver — every instance animates independently. `@pixiv/three-vrm` v3
+exposes no skeleton-rebind clone (`VRM.prototype` is `[constructor, update]` only;
+there is no `vrm.clone()` / `VRMUtils.clone`), and its humanoid/spring-bone/
+expression managers bind the bones of the scene they were parsed against. Rather
+than share one runtime, the pool retains the asset's raw GLB bytes and **re-parses
+an independent VRM per driven entity** — each gets its own scene, its own humanoid/
+spring-bone/expression managers, and is driven independently by `vrm.update(dt)`.
+N pooled instances of one VRM all animate (distinct spring physics, distinct
+expressions); none freeze in bind pose. Per-instance parses are concurrency-bounded
+(heavy work) and queue when the limit is reached. This mirrors how a multiplayer
+host parses one VRM per player.
 
-`pool.dispose()` tears the pool down (every entity, then every asset); each
-asset's `dispose()` calls `VRMUtils.deepDispose()` to free the VRM runtime.
+`entity.dispose()` runs `VRMUtils.deepDispose()` on that entity's own VRM scene,
+freeing its spring/collider/expression GPU resources without touching siblings.
+`pool.dispose()` tears the pool down (every entity, then every asset).
 
 ## Layout
 
