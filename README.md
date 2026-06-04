@@ -69,6 +69,31 @@ host parses one VRM per player.
 freeing its spring/collider/expression GPU resources without touching siblings.
 `pool.dispose()` tears the pool down (every entity, then every asset).
 
+## Geometry decoding (Draco + meshopt)
+
+Baked GLBs are compressed with both meshopt and Draco
+(`KHR_draco_mesh_compression`). meshopt decodes via three's
+`MeshoptDecoder`. Draco decodes via **[draco.js](https://github.com/mrdoob/draco.js)**,
+mrdoob's pure-JavaScript port of the Draco decoder, vendored at
+`examples/local-progressive/draco-loader.js` as a drop-in for three's own
+`DRACOLoader`.
+
+This replaces the WASM Draco decoder. The win is deployment simplicity: no
+`.wasm` fetch and no runtime CDN — the previous setup pulled the decoder from
+`https://www.gstatic.com/draco/versioned/decoders/...` on first decode, a
+third-party runtime dependency with cross-origin/CSP exposure. draco.js is one
+~24 KB-gzipped ES module that ships with the page. It is decode-only (the
+bake-time encoder in `tools/bake-progressive.mjs` still uses the `draco3dgltf`
+WASM module, which is a dev-time Node dependency, not shipped to the browser),
+and implements the EdgeBreaker triangle-mesh path that glTF/Draco content uses.
+WASM is faster in absolute terms (~1.4-1.6x on large meshes) but the decode is
+byte-for-byte equivalent.
+
+The LOD web worker (`lod-worker.js`) loads the same vendored module, rewriting
+its bare `three` import to the esm.sh URL the worker already uses, so
+Draco+meshopt sibling LODs decode off-thread too. Decoder logic is a port of
+Google Draco (Apache-2.0); the loader API mirrors three.js's `DRACOLoader` (MIT).
+
 ## Layout
 
 - `examples/local-progressive/` — the renderer (latest). Entry: `stress.html` →

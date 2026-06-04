@@ -19,7 +19,9 @@
 
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
-import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+// Pure-JS Draco decoder (mrdoob draco.js), vendored at ./draco-loader.js — a
+// drop-in for three's DRACOLoader that needs no .wasm fetch and no gstatic CDN.
+import { DRACOLoader } from './draco-loader.js';
 import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
 import { VRMLoaderPlugin, VRMUtils } from '@pixiv/three-vrm';
 import { GlobalMaterialPool } from './material-pool.js';
@@ -33,8 +35,8 @@ import { VertexCompressionOptimizer } from './vertex-compression.js';
 import { DrawCallSorter, buildDrawCallDescriptors, applyDrawCallSort } from './draw-call-sorter.js';
 import { InstanceBufferPool } from './buffer-pool.js';
 
+// draco.js decodes in pure JS — no decoder path / wasm to configure.
 const _sharedDracoLoader = new DRACOLoader();
-_sharedDracoLoader.setDecoderPath('https://www.gstatic.com/draco/versioned/decoders/1.5.7/');
 
 // --- scratch objects (per-frame; never alloc in hot path) -----------------
 const _tmpV3 = new THREE.Vector3();

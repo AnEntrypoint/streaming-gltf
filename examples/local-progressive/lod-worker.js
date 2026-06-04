@@ -37,6 +37,32 @@ const readyPromise = new Promise((r) => { readyResolve = r; });
     MeshoptDecoder = meshoptMod.MeshoptDecoder;
     loader = new GLTFLoader();
     loader.setMeshoptDecoder(MeshoptDecoder);
+    // Draco: the shipped sibling LODs carry BOTH meshopt and Draco
+    // (KHR_draco_mesh_compression), so the worker's GLTFLoader needs a
+    // DRACOLoader too — without it parse() throws "No DRACOLoader instance
+    // provided" and every sibling silently falls back to the main thread.
+    // We reuse the SAME vendored pure-JS draco.js the main thread uses
+    // (./draco-loader.js, same-origin). It imports the bare specifier `three`,
+    // which a module worker can't resolve (no importmap), so we fetch its
+    // source, rewrite that import to the esm.sh URL already in use here, and
+    // import the rewritten module via a blob URL — keeping one vendored source
+    // of truth while making it worker-loadable.
+    try {
+      const dracoSrc = await (await fetch(new URL('./draco-loader.js', self.location.href))).text();
+      const patched = dracoSrc.replace(
+        /from\s*["']three["']/g,
+        "from 'https://esm.sh/three@0.170.0'"
+      );
+      const blobUrl = URL.createObjectURL(new Blob([patched], { type: 'text/javascript' }));
+      const dracoMod = await import(blobUrl);
+      URL.revokeObjectURL(blobUrl);
+      loader.setDRACOLoader(new dracoMod.DRACOLoader());
+    } catch (de) {
+      // Non-fatal: leave DRACOLoader unset. Draco siblings then fail in this
+      // worker and the pool's main-thread fallback (which has the loader)
+      // decodes them — slower, but correct.
+      self.postMessage({ id: 0, ok: true, ready: false, warn: 'worker draco init failed: ' + String(de && (de.message || de)) });
+    }
     readyResolve(true);
     self.postMessage({ id: 0, ok: true, ready: true });
   } catch (e) {
