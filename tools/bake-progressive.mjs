@@ -378,6 +378,17 @@ export async function bakeProgressive(INPUT, OUT_DIR) {
         const newIndices = simplified?.getIndices()?.getCount() ?? 0;
         const newVerts = simplified?.getAttribute('POSITION')?.getCount() ?? 0;
 
+        // Skip a ratio that simplified a primitive down to nothing: an empty LOD
+        // entry (0 indices / 0 verts) would be shipped and, when selected, render
+        // a hole where that primitive's geometry should be. Small prims at an
+        // aggressive ratio collapse to 0 — keep the prior (denser) geometry for
+        // them instead of emitting an empty chunk. Witnessed on aim_sillos where
+        // ~a handful of small wall prims dropped out as missing faces.
+        if (newIndices === 0 || newVerts === 0) {
+          console.warn(`[bake-progressive] skip empty LOD prim (ratio=${ratio}, mesh=${cloneMesh.getName?.() || '?'}, prim=${pi}) - keeping denser geometry`);
+          continue;
+        }
+
         if (isLowest) {
           // Lowest LOD will be folded into the root output as the inline geometry.
           // We keep cloneDoc in memory and use it below.
