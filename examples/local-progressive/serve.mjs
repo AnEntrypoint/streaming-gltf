@@ -10,6 +10,9 @@ import { fileURLToPath } from 'node:url';
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const ROOT = resolve(__dirname);
 const PORT = Number(process.env.PORT) || 5180;
+// Optional mount for the "difficult GLBs" impostor test corpus. Served read-only
+// under /glb_fixed/<name>; overridable via GLB_FIXED_DIR. Off the deploy path.
+const GLB_FIXED_DIR = resolve(process.env.GLB_FIXED_DIR || 'C:/dev/maps/output/glb_fixed');
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -38,8 +41,24 @@ createServer(async (req, res) => {
       res.end(body);
       return;
     }
-    const full = normalize(join(ROOT, urlPath));
-    if (!full.startsWith(ROOT)) { res.writeHead(403).end('forbidden'); return; }
+    if (urlPath === '/glb_fixed-list.json') {
+      const entries = await readdir(GLB_FIXED_DIR, { withFileTypes: true }).catch(() => []);
+      const files = entries
+        .filter((e) => e.isFile() && e.name.toLowerCase().endsWith('.glb'))
+        .map((e) => e.name)
+        .sort();
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+      res.end(JSON.stringify(files));
+      return;
+    }
+
+    let base = ROOT;
+    if (urlPath.startsWith('/glb_fixed/')) {
+      base = GLB_FIXED_DIR;
+      urlPath = urlPath.slice('/glb_fixed'.length); // -> /<name>.glb under base
+    }
+    const full = normalize(join(base, urlPath));
+    if (!full.startsWith(base)) { res.writeHead(403).end('forbidden'); return; }
 
     const s = await stat(full).catch(() => null);
     if (!s || !s.isFile()) { res.writeHead(404).end('not found'); return; }

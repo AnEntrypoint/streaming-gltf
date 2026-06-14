@@ -77,6 +77,15 @@ const pool = new ModelPool({
   // dots = ~2% coverage with OR without batching; identical coverage confirmed
   // at matched cameras, and HIGHER close-up: 0.53 vs 0.47).
   useBatchedFarTier: true,
+  // Octahedral impostor FINAL LOD — opt in with ?impostor=1 (optionally
+  // &impostorPx=NN to tune the enter-distance). Below that on-screen size each
+  // model collapses to one billboard sampling a per-asset octahedral atlas baked
+  // on-the-fly, all in ONE InstancedMesh draw across every asset.
+  useImpostorFinalLod: new URLSearchParams(location.search).get('impostor') === '1',
+  impostorPx: Number(new URLSearchParams(location.search).get('impostorPx')) || 14,
+  impostorBlend: new URLSearchParams(location.search).get('impostorBlend') === '1',
+  // Pass-through only when explicitly set; otherwise the pool default applies.
+  impostorCellBudget: Number(new URLSearchParams(location.search).get('impostorCellBudget')) || undefined,
 });
 window.__pool = pool;
 

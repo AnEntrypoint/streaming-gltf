@@ -23,6 +23,10 @@ node_modules/
 examples/local-progressive/fps-measurement.json
 .gm/pw-sock-*/
 
+# Generated impostor test/witness output (regenerate via impostor-*smoke.mjs)
+examples/local-progressive/impostor-*.png
+examples/local-progressive/impostor-*smoke.json
+
 # Harness session dir + transient install lockfile (deps tracked via package.json)
 .claude/
 package-lock.json

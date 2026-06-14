@@ -30,6 +30,7 @@ import { LodUnloadManager } from './lod-unload-manager.js';
 import { CachedFrustumPlanes } from './frustum-cache.js';
 import { MultiDrawOptimizer } from './multi-draw-optimizer.js';
 import { BatchedFarTier } from './batched-far-tier.js';
+import { OctahedralImpostorTier } from './octahedral-impostor-tier.js';
 // Phase 3 Quick-Wins optimizations
 import { VertexCompressionOptimizer } from './vertex-compression.js';
 import { DrawCallSorter, buildDrawCallDescriptors, applyDrawCallSort } from './draw-call-sorter.js';
@@ -1436,7 +1437,17 @@ class Entity extends Emitter {
         }
       }
     }
-    {
+    // Octahedral impostor FINAL LOD: in the far band (above sub-pixel cull,
+    // below _impostorPx) draw the WHOLE entity as one billboard and skip the
+    // per-primitive LOD/matrix work below. Entry/exit hides/restores the
+    // entity's normal draws (respecting any sub-pixel cull).
+    let impostorHandled = false;
+    if (this.pool._useImpostorFinalLod) {
+      impostorHandled = (!this._subPixelCulled)
+        ? this._updateImpostor(screenPx, world, radius, movable)
+        : (this._impostorActive ? (this._exitImpostor(), false) : false);
+    }
+    if (!impostorHandled) {
       // Re-pick LOD only when something that affects the choice changed since
       // this entity last picked: the pool bumps _lodEpoch when the camera moved
       // or _lodDistanceScale shifted beyond a quantum. A still camera + stable
@@ -1520,7 +1531,9 @@ class Entity extends Emitter {
     // refresh the per-instance world-space bound-sphere center for GPU
     // frustum culling — only when the entity actually moves (root has
     // auto-update on, or is flagged for one-shot rebuild).
-    for (const tm of this.trackedMeshes) {
+    // Skipped while the impostor tier owns this entity (its tracked draws are
+    // parked at the zero matrix; pushing real transforms would un-hide them).
+    for (const tm of (impostorHandled ? [] : this.trackedMeshes)) {
       if (tm._instancedSlot && tm._instancedSlotIdx >= 0) {
         // Compute the slot's world matrix at most ONCE per frame: both the matrix
         // push and the bound-sphere refresh below read the same transform, and
@@ -1611,9 +1624,75 @@ class Entity extends Emitter {
     return r;
   }
 
+  // FINAL-LOD octahedral impostor. Returns true if this entity is currently
+  // represented by an impostor billboard (and the caller should skip the normal
+  // per-primitive LOD + matrix work this frame). `world` is the primary mesh
+  // world position, `worldRadius` its world bound radius, both already computed.
+  _updateImpostor(screenPx, world, worldRadius, movable) {
+    const tier = this.pool._getImpostorTier();
+    if (!tier) return false;
+    const onPx = this.pool._impostorPx ?? 14;
+    const enterPx = this._impostorActive ? onPx + 2 : onPx; // +2 exit hysteresis
+    if (!(screenPx > 0 && screenPx < enterPx)) {
+      if (this._impostorActive) this._exitImpostor();
+      return false;
+    }
+    // Use the asset's atlas if already baked; otherwise queue a bake (drained
+    // 1/frame in update(), so a far camera bringing many assets into range at
+    // once spreads the GRIDxGRID renders across frames instead of stuttering) and
+    // stay on the current far LOD until the atlas is ready.
+    const desc = this.pool._impostorTier && this.pool._impostorTier.hasAsset(this.asset)
+      ? this.pool._impostorTier._assetLayers.get(this.asset.url)
+      : null;
+    if (!desc) {
+      if (this._impostorActive) this._exitImpostor();
+      this.pool._queueImpostorBake(this.asset, this);
+      return false;
+    }
+    // Compose the world billboard placement from the asset-local descriptor and
+    // this entity's transform (uniform-scale factor = |scale| / √3).
+    const wc = _tmpV3b.copy(desc.center).applyMatrix4(this.root.matrixWorld);
+    const s = this.root.scale.length() / 1.7320508; // √3
+    const wr = desc.radius * s;
+    if (!this._impostorActive) {
+      this._setTrackedDrawsHidden(true);
+      this._impostorActive = true;
+      this.pool._impostorActiveCount++;
+      this._impostorId = tier.acquire(this, desc.layer, wc.x, wc.y, wc.z, wr);
+    } else if (movable) {
+      tier.setCenter(this._impostorId, wc.x, wc.y, wc.z, wr);
+    }
+    return this._impostorId >= 0;
+  }
+
+  _exitImpostor() {
+    if (!this._impostorActive) return;
+    if (this.pool._impostorTier) this.pool._impostorTier.release(this);
+    this._impostorActive = false;
+    this._impostorId = -1;
+    this.pool._impostorActiveCount = Math.max(0, this.pool._impostorActiveCount - 1);
+    this._setTrackedDrawsHidden(false); // respects sub-pixel cull internally
+  }
+
+  // Hide (or restore) every tracked-mesh draw for this entity. Mirrors the
+  // sub-pixel cull pattern: instanced slots park at the zero matrix, per-entity
+  // meshes toggle visibility. On restore, a still-sub-pixel-culled entity stays
+  // hidden so impostor exit can't accidentally un-cull it.
+  _setTrackedDrawsHidden(hidden) {
+    const cull = hidden || this._subPixelCulled;
+    for (const tm of this.trackedMeshes) {
+      if (tm._instancedSlot && tm._instancedSlotIdx >= 0) {
+        tm._instancedSlot.setMatrixForSlot(tm._instancedSlotIdx, cull ? _zeroMatrix : this._slotWorldMatrix(tm));
+      } else if (tm.mesh) {
+        tm.mesh.visible = !cull;
+      }
+    }
+  }
+
   dispose() {
     if (this._disposed) return;
     this._disposed = true;
+    if (this._impostorActive && this.pool._impostorTier) this.pool._impostorTier.release(this);
     this.root.parent?.remove(this.root);
     // If we were detached for being fully instanced, the root has no parent
     // but _sceneParent still holds the original — nothing to remove there
@@ -1868,6 +1947,27 @@ export class ModelPool extends Emitter {
     // shared-BatchedMesh adapter instead of per-asset InstancedBatch slots.
     this._useBatchedFarTier = opts.useBatchedFarTier === true;
     this._batchedFarTier = null;
+    // Octahedral impostor FINAL LOD (opt-in, default off): below _impostorPx on
+    // screen the whole entity collapses to ONE billboard sampling a per-asset
+    // octahedral atlas (baked on-the-fly, in ONE InstancedMesh draw across all
+    // assets). One rung past the BatchedFarTier. See octahedral-impostor-tier.js.
+    this._useImpostorFinalLod = opts.useImpostorFinalLod === true;
+    this._impostorTier = null;
+    this._impostorPx = opts.impostorPx ?? 14;       // enter impostor below this px
+    this._impostorGrid = opts.impostorGrid ?? 8;
+    this._impostorCellPx = opts.impostorCellPx ?? 64;
+    // Cells baked per frame. Each cell re-renders the WHOLE model, so per-frame
+    // bake cost is ~budget * model-draw-cost; keep it low (4) so even a heavy
+    // multi-mesh map only adds a few renders/frame. A 64-cell atlas then takes
+    // ~16 frames (~0.27s) to fully bake, which is fine for a far LOD.
+    this._impostorCellBudget = opts.impostorCellBudget ?? 4;
+    this._impostorBakeQueue = new Map();                      // asset.url -> entity
+    this._impostorBlend = opts.impostorBlend === true;        // bilinear view cross-fade
+    // Eager-allocate the impostor tier at construction so its array-texture VRAM
+    // allocation lands at startup, NOT on the first swap (where it was a one-shot
+    // ~120ms+ frame hitch). No-op when impostors are disabled.
+    if (this._useImpostorFinalLod) this._getImpostorTier();
+    this._impostorActiveCount = 0;                  // stat: entities on impostors
     // GPU instance-transform texture: OPT-IN (default off). It was FPS-neutral
     // (static transforms upload once either way) and at 500 distinct it placed
     // instances off-screen/degenerate — the screen went ~empty (1.2% coverage)
@@ -2449,6 +2549,50 @@ export class ModelPool extends Emitter {
   // MATERIAL GROUPING OPTIMIZATION: Uses global material pool for FAR tier
   // instead of creating per-LOD materials. This reduces material count from
   // 8-12 to 3 (one per tier), reducing shader programs and state changes.
+  // Register an asset for on-the-fly impostor baking, baked from `entity`'s
+  // resident geometry. Drained with a per-frame CELL budget in update().
+  _queueImpostorBake(asset, entity) {
+    if (!this._impostorBakeQueue) this._impostorBakeQueue = new Map();
+    if (this._impostorTier && this._impostorTier.hasAsset(asset)) return;
+    if (!this._impostorBakeQueue.has(asset.url)) this._impostorBakeQueue.set(asset.url, entity);
+  }
+
+  // Drain the impostor bake queue using a per-frame CELL budget: render at most
+  // _impostorCellBudget octahedral cells total this frame, spread across queued
+  // assets via the tier's RESUMABLE bakeChunk. This is the swap-stall fix — a
+  // baking frame costs a few small cell-renders instead of a whole grid*grid
+  // atlas (which was tens-to-160+ms for heavy assets). Runs regardless of
+  // per-entity fast-skip, so a still camera still converges to full coverage.
+  _drainImpostorBakes() {
+    const q = this._impostorBakeQueue;
+    const tier = this._impostorTier;
+    if (!q || q.size === 0 || !tier) return;
+    let budget = this._impostorCellBudget;
+    for (const [url, entity] of q) {
+      if (budget <= 0) break;
+      if (!entity || entity._disposed) { q.delete(url); continue; }
+      if (tier.hasAsset(entity.asset)) { q.delete(url); continue; }
+      budget -= tier.bakeChunk(entity.asset, entity.root, budget);
+      if (tier.hasAsset(entity.asset)) q.delete(url);
+    }
+  }
+
+  // Lazily build the shared octahedral impostor tier and attach its single
+  // InstancedMesh to the scene. Null if impostors are disabled or unsupported.
+  _getImpostorTier() {
+    if (!this._useImpostorFinalLod) return null;
+    if (!this._impostorTier) {
+      if (!this.renderer || !this.scene) return null;
+      this._impostorTier = new OctahedralImpostorTier(this.renderer, {
+        grid: this._impostorGrid,
+        cellPx: this._impostorCellPx,
+        blend: this._impostorBlend,
+      });
+      this.scene.add(this._impostorTier.mesh);
+    }
+    return this._impostorTier;
+  }
+
   _getInstancedSlot(asset, meshDescIdx, lodIdx) {
     const desc = asset.meshLodDescs[meshDescIdx];
     if (!desc) return null;
@@ -2572,6 +2716,11 @@ export class ModelPool extends Emitter {
     const now = tUpdate0;
     const dt = (now - this._lastTick) / 1000;
     this._lastTick = now;
+    // Drain the on-the-fly impostor bake queue (<=budget/frame). Each atlas bake
+    // is GRIDxGRID synchronous renders (~tens of ms); the cap spreads them across
+    // frames so a far camera bringing many assets into range at once never
+    // stutters — entities awaiting their atlas stay on their existing far LOD.
+    if (this._useImpostorFinalLod) this._drainImpostorBakes();
     // EMA FPS over ~500ms (faster feedback than 1s).
     const instFps = dt > 0 ? 1 / dt : 60;
     this._fpsEma = this._fpsEma * 0.85 + instFps * 0.15;
@@ -2970,6 +3119,8 @@ export class ModelPool extends Emitter {
   // Public stats accessor (cheap, no allocation).
   getStats() {
     const stats = this._stats;
+    stats.impostors = this._impostorActiveCount;
+    stats.impostorLayers = this._impostorTier ? this._impostorTier._nextLayer : 0;
     // The four sub-stats (each allocates a fresh object) are HUD diagnostics that
     // change slowly; refresh them at most every 6th call instead of every call to
     // avoid per-call allocation churn. The base this._stats fields are live.
@@ -3109,5 +3260,21 @@ export class ModelPool extends Emitter {
     for (const asset of this._assets.values()) asset.dispose();
     this._assets.clear();
     this._loadQueue.clear();
+    // Tear down the shared far/impostor tiers so their GPU buffers (the impostor
+    // atlas array-texture is ~134 MB; the BatchedMesh holds multi-MB vertex/index
+    // buffers) are freed instead of leaking on pool teardown.
+    if (this._impostorTier) {
+      if (this.scene && this._impostorTier.mesh) this.scene.remove(this._impostorTier.mesh);
+      this._impostorTier.dispose();
+      this._impostorTier = null;
+    }
+    if (this._batchedFarTier) {
+      const m = this._batchedFarTier.mesh;
+      if (this.scene && m) this.scene.remove(m);
+      m?.geometry?.dispose?.();
+      m?.material?.dispose?.();
+      m?.dispose?.();
+      this._batchedFarTier = null;
+    }
   }
 }
