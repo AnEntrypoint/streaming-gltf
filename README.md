@@ -178,8 +178,16 @@ impostor distance — no bake step, no extra download. To avoid frame stalls, th
 bake is **incremental**: `impostorCellBudget` octahedral cells (default 4) are
 rendered per frame and the atlas accumulates over a few frames; the array-texture
 is eager-allocated at pool construction so its VRAM allocation is off the swap
-path. `?impostorBlend=1` enables an alpha-weighted bilinear cross-fade of the
-nearest captured views to soften cell-to-cell popping as the camera orbits.
+path. The budget is **headroom-gated** (like the LOD warm loader) — doubled when
+FPS sits above target so coverage converges faster, halved under target so baking
+never deepens a frame deficit. `?impostorBlend=1` enables an alpha-weighted
+bilinear cross-fade of the nearest captured views to soften cell-to-cell popping
+as the camera orbits.
+
+Each cell carries a small transparent **gutter** (`impostorPadding`, default 1.05:
+the model is captured at `radius × padding`) so a `LinearFilter` tap near a
+billboard edge lands on alpha-0 texels instead of bleeding the neighbouring view —
+without it, packed-edge-to-edge cells produce faint cross-view ghosting.
 
 ## Notes
 
