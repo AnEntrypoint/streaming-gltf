@@ -2567,7 +2567,16 @@ export class ModelPool extends Emitter {
     const q = this._impostorBakeQueue;
     const tier = this._impostorTier;
     if (!q || q.size === 0 || !tier) return;
+    // Headroom-gated cell budget (mirrors the frame-budgeted LOD warm loader):
+    // when FPS sits above target there is slack to converge impostor coverage
+    // faster (more distant models reach the 1-draw impostor sooner); when below
+    // target, back off toward 0 so baking never deepens a frame-time deficit.
+    // The base budget stays small so even the boosted path is a few cell-renders.
+    const fps = this._fpsEma || 60;
+    const target = this.targetFps || 50;
     let budget = this._impostorCellBudget;
+    if (fps > target + 10) budget = this._impostorCellBudget * 2;      // slack: converge faster
+    else if (fps < target) budget = Math.max(1, this._impostorCellBudget >> 1); // deficit: back off
     for (const [url, entity] of q) {
       if (budget <= 0) break;
       if (!entity || entity._disposed) { q.delete(url); continue; }
