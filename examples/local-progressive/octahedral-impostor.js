@@ -154,7 +154,7 @@ export function renderOctahedralCellRange(renderer, scene, cam, opts) {
 export function bakeOctahedralImpostor(renderer, object3D, opts = {}) {
   const grid = opts.grid ?? 8;                 // directions per axis (GRID^2 views)
   const cellPx = opts.cellPx ?? 128;           // pixels per captured view
-  const padding = opts.padding ?? 1.0;         // ortho half-extent scale (>=1 fits bound sphere)
+  const padding = opts.padding ?? 1.05;        // ortho half-extent scale (>=1): >1 leaves a transparent cell gutter to stop cross-view bleed
   const atlasPx = grid * cellPx;
 
   // World bound sphere of the object (in its own local frame, transform-agnostic

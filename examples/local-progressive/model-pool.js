@@ -1963,6 +1963,7 @@ export class ModelPool extends Emitter {
     this._impostorCellBudget = opts.impostorCellBudget ?? 4;
     this._impostorBakeQueue = new Map();                      // asset.url -> entity
     this._impostorBlend = opts.impostorBlend === true;        // bilinear view cross-fade
+    this._impostorPadding = opts.impostorPadding;             // cell gutter; undefined -> tier default 1.05
     // Eager-allocate the impostor tier at construction so its array-texture VRAM
     // allocation lands at startup, NOT on the first swap (where it was a one-shot
     // ~120ms+ frame hitch). No-op when impostors are disabled.
@@ -2596,6 +2597,7 @@ export class ModelPool extends Emitter {
         grid: this._impostorGrid,
         cellPx: this._impostorCellPx,
         blend: this._impostorBlend,
+        padding: this._impostorPadding,
       });
       this.scene.add(this._impostorTier.mesh);
     }

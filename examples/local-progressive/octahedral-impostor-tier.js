@@ -23,6 +23,12 @@ export class OctahedralImpostorTier {
     this.grid = opts.grid ?? 8;
     this.cellPx = opts.cellPx ?? 64;             // 64px/view is ample for a sub-14px FAR LOD
     this.blend = opts.blend === true;            // bilinear cross-fade of nearest views
+    // Capture the model at radius*padding so each octahedral cell carries a small
+    // TRANSPARENT gutter. Cells are packed edge-to-edge in the atlas, so without
+    // it a LinearFilter tap near a billboard edge bleeds the neighbouring view's
+    // texels (faint cross-view ghosting); the gutter makes that bleed land on
+    // alpha-0 texels instead. ~5% costs a hair of in-cell resolution.
+    this.padding = opts.padding ?? 1.05;
     // maxLayers * atlasPx^2 * 4 bytes is the WHOLE array-texture VRAM, allocated
     // up front (WebGL2 texStorage3D has no per-layer growth). 128 * 512^2 * 4 =
     // ~134 MB; the old 256 * 1024^2 * 4 was ~1 GB and its one-shot allocation was
@@ -187,7 +193,7 @@ export class OctahedralImpostorTier {
     if (_box.isEmpty()) return null;
     _box.getCenter(_center);
     _box.getSize(_size);
-    const radius = 0.5 * _size.length();
+    const radius = 0.5 * _size.length() * this.padding;
     if (!(radius > 0)) return null;
 
     const layer = this._nextLayer++;
@@ -242,7 +248,7 @@ export class OctahedralImpostorTier {
     if (job.cellsDone === 0) {
       _box.setFromObject(object3D);
       if (_box.isEmpty()) empty = true;
-      else { _box.getCenter(job.center); _box.getSize(_size); job.radius = 0.5 * _size.length(); }
+      else { _box.getCenter(job.center); _box.getSize(_size); job.radius = 0.5 * _size.length() * this.padding; }
     }
     if (!empty && job.radius > 0) {
       take = Math.min(cellBudget, total - job.cellsDone);
