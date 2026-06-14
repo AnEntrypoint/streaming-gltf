@@ -101,8 +101,9 @@ Google Draco (Apache-2.0); the loader API mirrors three.js's `DRACOLoader` (MIT)
   `material-pool.js`, `deferred-load-queue.js`, `lod-unload-manager.js`,
   `frustum-cache.js`, `multi-draw-optimizer.js` / `multi-draw-utils.js`,
   `vertex-compression.js`, `draw-call-sorter.js`, `buffer-pool.js`,
-  `lod-worker.js`). `serve.mjs` is the dev server; `measure-fps.mjs` the
-  steady-state FPS harness.
+  `lod-worker.js`, `octahedral-impostor.js` / `octahedral-impostor-tier.js`).
+  `serve.mjs` is the dev server; `measure-fps.mjs` the steady-state FPS harness;
+  `impostor-smoke.mjs` / `impostor-pool-smoke.mjs` are the impostor test harnesses.
 - `tools/` — the conversion + download pipeline:
   - `bake-progressive.mjs` — convert one source GLB into a progressive GLB
     (meshopt decimation + sharp texture resizing + a `EP_progressive_lod`
@@ -161,6 +162,24 @@ the Khronos glTF extension registry; the name is provisional until a
 registration PR to [KhronosGroup/glTF](https://github.com/KhronosGroup/glTF)
 lands. Assets baked before the rename (payload under `extras.LOCAL_progressive`)
 are still read by the runtime via a compatibility fallback.
+
+## Octahedral impostors (final LOD)
+
+Opt-in (`ModelPool` option `useImpostorFinalLod`, or the demo's `?impostor=1`).
+Past the vertex-color `BatchedMesh` far tier, a model below `impostorPx` (default
+14) screen pixels collapses to a single camera-facing billboard sampling a
+per-asset **octahedral atlas** — the model captured from a grid of directions and
+octahedral-encoded. Every distinct asset's atlas is a layer of one WebGL2
+`sampler2DArray`, so the entire far population draws in **one `InstancedMesh`
+draw call** (`octahedral-impostor-tier.js`).
+
+The atlas is rendered **on the fly** in-browser the first time an asset reaches
+impostor distance — no bake step, no extra download. To avoid frame stalls, the
+bake is **incremental**: `impostorCellBudget` octahedral cells (default 4) are
+rendered per frame and the atlas accumulates over a few frames; the array-texture
+is eager-allocated at pool construction so its VRAM allocation is off the swap
+path. `?impostorBlend=1` enables an alpha-weighted bilinear cross-fade of the
+nearest captured views to soften cell-to-cell popping as the camera orbits.
 
 ## Notes
 
