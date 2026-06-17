@@ -14,6 +14,41 @@ import sharp from 'sharp';
 import { mkdir, writeFile, rm, stat, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { buildPlod, readPlodHeader } from '../examples/local-progressive/plod-codec.js';
+
+// Opt-in: also emit a single-buffer progressive-LOD (.plod) per mesh primitive
+// alongside the discrete sibling LODs. One file holds coarse->fine self-contained
+// levels so a streaming reader renders each level the moment its bytes arrive.
+const EMIT_PLOD = process.env.BAKE_PLOD === '1';
+
+// Extract {positions, colors, index} from a gltf-transform primitive for the
+// .plod codec. Colors come from an existing COLOR_0, else are baked from the
+// base texture (area-weighted, same path the vertcolor LOD uses). Geometry-only
+// (no skin) -> caller must pass an unskinned/static primitive.
+function primToPlodGeo(prim, baseRGBA) {
+  const posAcc = prim.getAttribute('POSITION');
+  if (!posAcc) return null;
+  const vertCount = posAcc.getCount();
+  // gltf-transform de-interleaves accessors, so getArray() is the contiguous
+  // attribute array (no getX/getY on Accessor — that's three's BufferAttribute).
+  const posArr = posAcc.getArray();
+  const positions = posArr instanceof Float32Array ? posArr : Float32Array.from(posArr);
+  const idxAcc = prim.getIndices();
+  const index = idxAcc ? (idxAcc.getArray() instanceof Uint32Array ? idxAcc.getArray() : Uint32Array.from(idxAcc.getArray())) : null;
+  let colors = null;
+  let colorStride = 0;
+  const colAcc = prim.getAttribute('COLOR_0');
+  if (colAcc) {
+    // Normalized Uint8/Uint16 -> raw 0..255/0..65535 bytes; the codec's
+    // _normalizeColors converts (Float32 -> *255, Uint8 -> as-is).
+    colors = colAcc.getArray();
+    colorStride = colAcc.getType() === 'VEC4' ? 4 : 3;
+  } else if (baseRGBA) {
+    colors = buildAveragedVertexColors(prim, baseRGBA, vertCount); // Uint8 RGBA
+    colorStride = 4;
+  }
+  return { positions, colors, colorStride, index };
+}
 
 // Read a GLB and return its JSON chunk as a parsed object plus the original
 // binary chunk bytes. Used to round-trip extensions gltf-transform doesn't
@@ -339,6 +374,7 @@ export async function bakeProgressive(INPUT, OUT_DIR) {
       console.log(`[bake] mesh ${mi} prim ${pi}: ${baselineVerts} verts, ${baselineIndices} indices, ${morphCount} morph targets`);
 
       const lodEntries = [];
+      let plodPath = null;
 
       // gltf-transform's simplify() preserves morph target deltas alongside
       // POSITION/NORMAL when MeshoptSimplifier is used (it runs the simplifier
@@ -447,6 +483,29 @@ export async function bakeProgressive(INPUT, OUT_DIR) {
               width: decoded.info.width,
               height: decoded.info.height,
             };
+          }
+        }
+
+        // Opt-in: emit one progressive (.plod) buffer per primitive from the
+        // FULL-res baseline geometry (the codec builds its own coarse->fine
+        // levels via meshopt_simplify). This is the single-file streaming LOD
+        // that will eventually supersede the discrete sibling ladder.
+        if (EMIT_PLOD) {
+          try {
+            const geo = primToPlodGeo(baselinePrim, baseRGBA);
+            if (geo && geo.index && geo.index.length >= 3) {
+              const plodBuf = await buildPlod(geo, { ratios: [1 / 16, 1 / 8, 1 / 4, 1 / 2, 1] });
+              if (plodBuf) {
+                const fileName = `mesh_${mi}_${pi}.plod`;
+                const filePath = path.join(OUT_DIR, LODS_SUBDIR, fileName);
+                await writeFile(filePath, Buffer.from(plodBuf));
+                const hdr = readPlodHeader(new Uint8Array(plodBuf));
+                plodPath = `${LODS_SUBDIR}/${fileName}`;
+                console.log(`[bake]   plod -> ${fileName} (${(plodBuf.byteLength / 1024).toFixed(1)} KB, ${hdr.levelCount} levels: ${hdr.levels.map((l) => l.triCount).join('/')} tris)`);
+              }
+            }
+          } catch (e) {
+            console.warn(`[bake] plod emit skipped for mesh ${mi} prim ${pi}: ${e.message}`);
           }
         }
 
@@ -588,7 +647,7 @@ export async function bakeProgressive(INPUT, OUT_DIR) {
         }
       }
 
-      meshLODs.push({ meshIndex: mi, primIndex: pi, lods: lodEntries });
+      meshLODs.push({ meshIndex: mi, primIndex: pi, lods: lodEntries, plodPath });
     }
   }
 
@@ -682,6 +741,7 @@ export async function bakeProgressive(INPUT, OUT_DIR) {
     meshes: meshLODs.map((ml) => ({
       meshIndex: ml.meshIndex,
       primIndex: ml.primIndex,
+      plodPath: ml.plodPath || undefined,
       lods: ml.lods
         .filter((x) => !x.inline)
         .concat([{ ratio: ml.lods.find((x) => x.inline).ratio, inline: true, indexCount: ml.lods.find((x) => x.inline).indexCount }])
