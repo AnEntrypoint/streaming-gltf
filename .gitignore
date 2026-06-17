@@ -21,6 +21,8 @@ node_modules/
 
 # Generated FPS measurement output (run measure-fps.mjs to regenerate)
 examples/local-progressive/fps-measurement.json
+# Generated corpus-bake summary (run tools/bake-corpus.mjs to regenerate)
+examples/local-progressive/bake-corpus-summary.json
 .gm/pw-sock-*/
 
 # Generated impostor test/witness output (regenerate via impostor-*smoke.mjs)

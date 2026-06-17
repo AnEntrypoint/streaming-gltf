@@ -30,12 +30,42 @@ const LEVEL_RECORD_BYTES = 24;
 export const PLOD_VERSION = VERSION;
 
 // ---------------------------------------------------------------- helpers ----
-function _toU32Index(index, vertCount) {
-  if (index && index.length) return index instanceof Uint32Array ? index : Uint32Array.from(index);
-  // Non-indexed geometry: synthesize a sequential index so it still levels.
-  const seq = new Uint32Array(vertCount);
-  for (let i = 0; i < vertCount; i++) seq[i] = i;
-  return seq;
+// (non-indexed input is welded in buildPlod via _weldGeometry, not synthesized)
+// Weld a non-indexed triangle soup: dedup coincident vertices (quantized
+// position key) into a shared-topology indexed mesh so meshopt edge-collapse can
+// actually reduce it. Without this a sequential index has no shared edges and
+// simplify cannot drop below the source (the exec_js-46 1-level bug). colors is
+// the already-normalized Uint8 RGBA (stride 4) or null; normals Float32x3 or null.
+function _weldGeometry(positions, colors, normals) {
+  const vertCount = positions.length / 3;
+  const map = new Map();
+  const remap = new Uint32Array(vertCount);
+  let kept = 0;
+  const Q = 1e5; // ~1e-5 weld tolerance in mesh-local units
+  for (let i = 0; i < vertCount; i++) {
+    const kx = Math.round(positions[i * 3] * Q);
+    const ky = Math.round(positions[i * 3 + 1] * Q);
+    const kz = Math.round(positions[i * 3 + 2] * Q);
+    const key = kx + '|' + ky + '|' + kz;
+    let n = map.get(key);
+    if (n === undefined) { n = kept++; map.set(key, n); }
+    remap[i] = n;
+  }
+  const np = new Float32Array(kept * 3);
+  const nc = colors ? new Uint8Array(kept * 4) : null;
+  const nn = normals ? new Float32Array(kept * 3) : null;
+  const seen = new Uint8Array(kept);
+  for (let i = 0; i < vertCount; i++) {
+    const n = remap[i];
+    if (seen[n]) continue;
+    seen[n] = 1;
+    np[n * 3] = positions[i * 3]; np[n * 3 + 1] = positions[i * 3 + 1]; np[n * 3 + 2] = positions[i * 3 + 2];
+    if (nc) { nc[n * 4] = colors[i * 4]; nc[n * 4 + 1] = colors[i * 4 + 1]; nc[n * 4 + 2] = colors[i * 4 + 2]; nc[n * 4 + 3] = colors[i * 4 + 3]; }
+    if (nn) { nn[n * 3] = normals[i * 3]; nn[n * 3 + 1] = normals[i * 3 + 1]; nn[n * 3 + 2] = normals[i * 3 + 2]; }
+  }
+  const index = new Uint32Array(vertCount); // i-th soup vertex -> its welded id
+  for (let i = 0; i < vertCount; i++) index[i] = remap[i];
+  return { positions: np, colors: nc, normals: nn, index };
 }
 
 function _normalizeColors(colors, stride, vertCount) {
@@ -88,13 +118,21 @@ function _levelBodyBytes(vertCount, triCount, hasColor, hasNormal) {
 //        colorStride?:3|4, normals?:Float32Array }
 // opts: { ratios?:number[], targets?:number[] (tri counts), minTris?:number }
 export async function buildPlod(geo, opts = {}) {
-  const srcPos = geo.positions instanceof Float32Array ? geo.positions : Float32Array.from(geo.positions);
+  let srcPos = geo.positions instanceof Float32Array ? geo.positions : Float32Array.from(geo.positions);
+  const inVertCount = srcPos.length / 3;
+  if (!inVertCount) return null;
+  const colorStride = geo.colorStride || (geo.colors ? geo.colors.length / inVertCount : 0);
+  let srcCol = _normalizeColors(geo.colors, colorStride, inVertCount);
+  let srcNrm = geo.normals ? (geo.normals instanceof Float32Array ? geo.normals : Float32Array.from(geo.normals)) : null;
+  let fineIndex;
+  if (geo.index && geo.index.length) {
+    fineIndex = geo.index instanceof Uint32Array ? geo.index : Uint32Array.from(geo.index);
+  } else {
+    // Non-indexed soup -> weld so edge-collapse has shared topology to reduce.
+    const w = _weldGeometry(srcPos, srcCol, srcNrm);
+    srcPos = w.positions; srcCol = w.colors; srcNrm = w.normals; fineIndex = w.index;
+  }
   const vertCount = srcPos.length / 3;
-  if (!vertCount) return null;
-  const colorStride = geo.colorStride || (geo.colors ? geo.colors.length / vertCount : 0);
-  const srcCol = _normalizeColors(geo.colors, colorStride, vertCount);
-  const srcNrm = geo.normals ? (geo.normals instanceof Float32Array ? geo.normals : Float32Array.from(geo.normals)) : null;
-  const fineIndex = _toU32Index(geo.index, vertCount);
   const fineTris = fineIndex.length / 3;
   if (!fineTris) return null;
 

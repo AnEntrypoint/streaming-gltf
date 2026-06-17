@@ -189,9 +189,33 @@ the model is captured at `radius × padding`) so a `LinearFilter` tap near a
 billboard edge lands on alpha-0 texels instead of bleeding the neighbouring view —
 without it, packed-edge-to-edge cells produce faint cross-view ghosting.
 
+### Lit impostor variant (`?impostorEz=1`)
+
+An alternative impostor tier (`octahedral-impostor-ez-tier.js`) renders **lit**
+impostors: the on-the-fly atlas is a 2-target render (albedo + packed
+normal/depth), so the billboard receives scene lighting (a real
+`MeshStandardMaterial`) and blends the three nearest captured views with
+per-sprite plane-projected UVs. It bakes a 1024 atlas (handles ~1M-triangle
+source models) incrementally, capped by `impostorMaxAssets`. Opt in with
+`?impostorEz=1` (or `useImpostorEz`); the default tier above stays the
+single-draw performant path. The impostor sampling/baking code is localized from
+[@three.ez/octahedron-imposter](https://github.com/agargaro/octahedral-impostor)
+(`octahedral-impostor-ez.js`).
+
 ## Notes
 
 - The renderer is draw-call-bound at scale; the FAR tier collapses many distinct
   models into a single `THREE.BatchedMesh` draw and the FPS controller adjusts
   LOD *distance* (not a global ceiling) to hold the target frame rate.
 - Baked `output_*/` assets are git-ignored (regenerate with the bake tools).
+
+## Credits
+
+- **[@three.ez/octahedron-imposter](https://github.com/agargaro/octahedral-impostor)**
+  by Andrea Gargaro (MIT) — the lit octahedral impostor (atlas capture + sampling
+  shaders) is localized into `examples/local-progressive/octahedral-impostor-ez.js`
+  (TS ported to JS, GLSL inlined, full-octahedron encode/decode completed). The
+  related `@three.ez/batched-mesh-extensions` was evaluated but not vendored: its
+  draw/cull wins are non-binding here (the far tier already draws in one call).
+- **[draco.js](https://github.com/mrdoob/draco.js)** by mrdoob (Apache-2.0) —
+  vendored pure-JS Draco decoder (`draco-loader.js`).
