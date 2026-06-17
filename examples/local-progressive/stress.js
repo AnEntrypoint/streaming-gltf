@@ -86,6 +86,13 @@ const pool = new ModelPool({
   impostorBlend: new URLSearchParams(location.search).get('impostorBlend') === '1',
   // Pass-through only when explicitly set; otherwise the pool default applies.
   impostorCellBudget: Number(new URLSearchParams(location.search).get('impostorCellBudget')) || undefined,
+  // EZ impostor path (localized @three.ez/octahedron-imposter) — LIT impostors
+  // via a 1024 MRT atlas per asset. Opt in with ?impostorEz=1 (with ?impostor=1).
+  // &impostorTextureSize=NN, &impostorMaxAssets=NN, &impostorHemiOcta=1 tune it.
+  useImpostorEz: new URLSearchParams(location.search).get('impostorEz') === '1',
+  impostorTextureSize: Number(new URLSearchParams(location.search).get('impostorTextureSize')) || undefined,
+  impostorMaxAssets: Number(new URLSearchParams(location.search).get('impostorMaxAssets')) || undefined,
+  impostorHemiOcta: new URLSearchParams(location.search).get('impostorHemiOcta') === '1',
 });
 window.__pool = pool;
 

@@ -375,167 +375,161 @@ const _oldViewport = new Vector4();
 const _coords = new Vector2();
 const USERDATA_MAT_KEY = 'ez_originalMaterial';
 
-// params: { renderer, target, useHemiOctahedron, textureSize?=2048,
-//           spritesPerSide?=16, cameraFactor?=1 }
-// -> { renderTarget, albedo, normalDepth }
-export function createTextureAtlas(params) {
-  const { renderer, target, useHemiOctahedron } = params;
-  if (!renderer) throw new Error('createTextureAtlas: "renderer" is mandatory.');
-  if (!target) throw new Error('createTextureAtlas: "target" is mandatory.');
-  if (useHemiOctahedron == null) throw new Error('createTextureAtlas: "useHemiOctahedron" is mandatory.');
+// Build the MRT capture material that mirrors a source material's maps but
+// outputs albedo (location 0) + packed normal/depth (location 1).
+function _makeCaptureMaterial(material) {
+  const hasMap = !!material.map;
+  const hasAlphaMap = !!material.alphaMap;
+  const hasNormalMap = !!material.normalMap;
+  const hasBumpMap = !!material.bumpMap;
+  const hasDisplacementMap = !!material.displacementMap;
+  const hasAlphaTest = material.alphaTest > 0;
 
-  const atlasSize = params.textureSize ?? 2048;
-  const countPerSide = params.spritesPerSide ?? 16;
-  const countPerSideMinusOne = countPerSide - 1;
+  const uniforms = {
+    diffuse: { value: material.color },
+    opacity: { value: material.opacity },
+  };
+  if (hasAlphaTest) uniforms.alphaTest = { value: material.alphaTest };
+  if (hasMap) { uniforms.map = { value: material.map }; uniforms.mapTransform = { value: material.map.matrix }; }
+  if (hasAlphaMap) { uniforms.alphaMap = { value: material.alphaMap }; uniforms.alphaMapTransform = { value: material.alphaMap.matrix }; }
+  if (hasNormalMap) { uniforms.normalMap = { value: material.normalMap }; uniforms.normalScale = { value: material.normalScale }; uniforms.normalMapTransform = { value: material.normalMap.matrix }; }
+  if (hasBumpMap) { uniforms.bumpMap = { value: material.bumpMap }; uniforms.bumpScale = { value: material.bumpScale }; uniforms.bumpMapTransform = { value: material.bumpMap.matrix }; }
+  if (hasDisplacementMap) { uniforms.displacementMap = { value: material.displacementMap }; uniforms.displacementScale = { value: material.displacementScale }; uniforms.displacementBias = { value: material.displacementBias }; uniforms.displacementMapTransform = { value: material.displacementMap.matrix }; }
+
+  const defines = {};
+  if (hasMap || hasAlphaMap || hasNormalMap || hasBumpMap || hasDisplacementMap) defines.USE_UV = '';
+  if (material.vertexColors) defines.USE_COLOR = '';
+
+  const shaderMaterial = new ShaderMaterial({
+    uniforms, defines, vertexShader: ATLAS_VERTEX, fragmentShader: ATLAS_FRAGMENT, glslVersion: GLSL3,
+    transparent: material.transparent, side: material.side, alphaHash: material.alphaHash,
+    depthFunc: material.depthFunc, depthWrite: material.depthWrite, depthTest: material.depthTest,
+    vertexColors: material.vertexColors, precision: material.precision, visible: material.visible,
+  });
+
+  shaderMaterial.onBeforeCompile = (shader) => {
+    if (hasMap) { shader.map = true; shader.mapUv = 'uv'; }
+    if (hasAlphaMap) { shader.alphaMap = true; shader.alphaMapUv = 'uv'; }
+    if (hasNormalMap) {
+      shader.normalMap = true; shader.normalMapUv = 'uv';
+      shader.normalMapTangentSpace = material.normalMapType === TangentSpaceNormalMap;
+      shader.normalMapObjectSpace = material.normalMapType === ObjectSpaceNormalMap;
+    }
+    if (hasBumpMap) { shader.bumpMap = true; shader.bumpMapUv = 'uv'; }
+    if (hasDisplacementMap) { shader.displacementMap = true; shader.displacementMapUv = 'uv'; }
+    shader.flatShading = material.flatShading;
+    shader.alphaTest = hasAlphaTest;
+  };
+
+  return shaderMaterial;
+}
+
+function _overrideTargetMaterial(target) {
+  target.traverse((mesh) => {
+    if (mesh.material) {
+      const material = mesh.material;
+      mesh.userData[USERDATA_MAT_KEY] = material;
+      mesh.material = Array.isArray(material) ? material.map((m) => _makeCaptureMaterial(m)) : _makeCaptureMaterial(material);
+    }
+  });
+}
+
+function _restoreTargetMaterial(target) {
+  target.traverse((mesh) => {
+    if (mesh.userData[USERDATA_MAT_KEY]) {
+      mesh.material = mesh.userData[USERDATA_MAT_KEY];
+      delete mesh.userData[USERDATA_MAT_KEY];
+    }
+  });
+}
+
+// Allocate the 2-target (albedo + packed normalDepth) atlas render target.
+export function createAtlasRenderTarget(atlasSize) {
+  const rt = new WebGLRenderTarget(atlasSize, atlasSize, { count: 2, generateMipmaps: true });
+  rt.textures[0].minFilter = LinearMipmapLinearFilter;
+  rt.textures[0].magFilter = LinearFilter;
+  rt.textures[0].type = UnsignedByteType;
+  rt.textures[0].colorSpace = LinearSRGBColorSpace;
+  rt.textures[1].minFilter = NearestMipMapNearestFilter;
+  rt.textures[1].magFilter = NearestFilter;
+  rt.textures[1].type = UnsignedByteType;
+  rt.textures[1].colorSpace = LinearSRGBColorSpace;
+  return rt;
+}
+
+// Render octahedral cells [cellStart, cellStart+cellCount) of `target` into
+// `renderTarget`, framing the ortho camera on `bSphere`. Renderer state is
+// saved/restored each call (autoClear stays on so each cell's render clears its
+// own scissor region) -> safe to interleave with the main render loop for
+// INCREMENTAL baking (no whole-atlas stall). Returns cells rendered.
+export function renderAtlasCells(renderer, target, renderTarget, opts) {
+  const { atlasSize, countPerSide, bSphere, cameraFactor = 1, useHemiOctahedron, cellStart, cellCount } = opts;
+  const countMinusOne = countPerSide - 1;
   const spriteSize = atlasSize / countPerSide;
+  const total = countPerSide * countPerSide;
+  const end = Math.min(cellStart + cellCount, total);
 
-  computeObjectBoundingSphere(target, _bSphere, true);
-  const cameraFactor = params.cameraFactor ?? 1;
-  updateCamera();
+  const oldPixelRatio = renderer.getPixelRatio();
+  const oldScissorTest = renderer.getScissorTest();
+  const oldClearAlpha = renderer.getClearAlpha();
+  const oldTarget = renderer.getRenderTarget();
+  renderer.getScissor(_oldScissor);
+  renderer.getViewport(_oldViewport);
 
-  const { renderTarget, oldPixelRatio, oldScissorTest, oldClearAlpha } = setupRenderer();
-  overrideTargetMaterial(target);
+  _camera.left = -bSphere.radius; _camera.right = bSphere.radius;
+  _camera.top = bSphere.radius; _camera.bottom = -bSphere.radius;
+  _camera.zoom = cameraFactor; _camera.near = 0.001; _camera.far = bSphere.radius * 2 + 0.001;
+  _camera.updateProjectionMatrix();
 
-  for (let row = 0; row < countPerSide; row++) {
-    for (let col = 0; col < countPerSide; col++) renderView(col, row);
-  }
+  renderer.setRenderTarget(renderTarget);
+  renderer.setScissorTest(true);
+  renderer.setPixelRatio(1);
+  renderer.setClearAlpha(0);
 
-  restoreRenderer();
-  restoreTargetMaterial(target);
-
-  return { renderTarget, albedo: renderTarget.textures[0], normalDepth: renderTarget.textures[1] };
-
-  function overrideTargetMaterial(t) {
-    t.traverse((mesh) => {
-      if (mesh.material) {
-        const material = mesh.material;
-        mesh.userData[USERDATA_MAT_KEY] = material;
-        mesh.material = Array.isArray(material) ? material.map((m) => createMaterial(m)) : createMaterial(material);
-      }
-    });
-  }
-
-  function createMaterial(material) {
-    const hasMap = !!material.map;
-    const hasAlphaMap = !!material.alphaMap;
-    const hasNormalMap = !!material.normalMap;
-    const hasBumpMap = !!material.bumpMap;
-    const hasDisplacementMap = !!material.displacementMap;
-    const hasAlphaTest = material.alphaTest > 0;
-
-    const uniforms = {
-      diffuse: { value: material.color },
-      opacity: { value: material.opacity },
-    };
-    if (hasAlphaTest) uniforms.alphaTest = { value: material.alphaTest };
-    if (hasMap) { uniforms.map = { value: material.map }; uniforms.mapTransform = { value: material.map.matrix }; }
-    if (hasAlphaMap) { uniforms.alphaMap = { value: material.alphaMap }; uniforms.alphaMapTransform = { value: material.alphaMap.matrix }; }
-    if (hasNormalMap) { uniforms.normalMap = { value: material.normalMap }; uniforms.normalScale = { value: material.normalScale }; uniforms.normalMapTransform = { value: material.normalMap.matrix }; }
-    if (hasBumpMap) { uniforms.bumpMap = { value: material.bumpMap }; uniforms.bumpScale = { value: material.bumpScale }; uniforms.bumpMapTransform = { value: material.bumpMap.matrix }; }
-    if (hasDisplacementMap) { uniforms.displacementMap = { value: material.displacementMap }; uniforms.displacementScale = { value: material.displacementScale }; uniforms.displacementBias = { value: material.displacementBias }; uniforms.displacementMapTransform = { value: material.displacementMap.matrix }; }
-
-    const defines = {};
-    if (hasMap || hasAlphaMap || hasNormalMap || hasBumpMap || hasDisplacementMap) defines.USE_UV = '';
-
-    const shaderMaterial = new ShaderMaterial({
-      uniforms, defines, vertexShader: ATLAS_VERTEX, fragmentShader: ATLAS_FRAGMENT, glslVersion: GLSL3,
-      transparent: material.transparent, side: material.side, alphaHash: material.alphaHash,
-      depthFunc: material.depthFunc, depthWrite: material.depthWrite, depthTest: material.depthTest,
-      blending: material.blending, blendSrc: material.blendSrc, blendDst: material.blendDst,
-      blendEquation: material.blendEquation, blendSrcAlpha: material.blendSrcAlpha, blendDstAlpha: material.blendDstAlpha,
-      blendEquationAlpha: material.blendEquationAlpha, premultipliedAlpha: material.premultipliedAlpha,
-      alphaToCoverage: material.alphaToCoverage, blendAlpha: material.blendAlpha, blendColor: material.blendColor,
-      colorWrite: material.colorWrite, forceSinglePass: material.forceSinglePass, vertexColors: material.vertexColors,
-      precision: material.precision, visible: material.visible,
-    });
-
-    shaderMaterial.onBeforeCompile = (shader) => {
-      if (hasMap) { shader.map = true; shader.mapUv = 'uv'; }
-      if (hasAlphaMap) { shader.alphaMap = true; shader.alphaMapUv = 'uv'; }
-      if (hasNormalMap) {
-        shader.normalMap = true; shader.normalMapUv = 'uv';
-        shader.normalMapTangentSpace = material.normalMapType === TangentSpaceNormalMap;
-        shader.normalMapObjectSpace = material.normalMapType === ObjectSpaceNormalMap;
-      }
-      if (hasBumpMap) { shader.bumpMap = true; shader.bumpMapUv = 'uv'; }
-      if (hasDisplacementMap) { shader.displacementMap = true; shader.displacementMapUv = 'uv'; }
-      shader.flatShading = material.flatShading;
-      shader.alphaTest = hasAlphaTest;
-    };
-
-    return shaderMaterial;
-  }
-
-  function restoreTargetMaterial(t) {
-    t.traverse((mesh) => {
-      if (mesh.userData[USERDATA_MAT_KEY]) {
-        mesh.material = mesh.userData[USERDATA_MAT_KEY];
-        delete mesh.userData[USERDATA_MAT_KEY];
-      }
-    });
-  }
-
-  function renderView(col, row) {
-    _coords.set(col / countPerSideMinusOne, row / countPerSideMinusOne);
+  _overrideTargetMaterial(target);
+  for (let k = cellStart; k < end; k++) {
+    const col = k % countPerSide, row = Math.floor(k / countPerSide);
+    _coords.set(col / countMinusOne, row / countMinusOne);
     if (useHemiOctahedron) hemiOctaGridToDir(_coords, _camera.position);
     else octaGridToDir(_coords, _camera.position);
-
-    _camera.position.setLength(_bSphere.radius * cameraFactor).add(_bSphere.center);
-    _camera.lookAt(_bSphere.center);
-
+    _camera.position.setLength(bSphere.radius * cameraFactor).add(bSphere.center);
+    _camera.lookAt(bSphere.center);
     const xOffset = (col / countPerSide) * atlasSize;
     const yOffset = (row / countPerSide) * atlasSize;
     renderer.setViewport(xOffset, yOffset, spriteSize, spriteSize);
     renderer.setScissor(xOffset, yOffset, spriteSize, spriteSize);
     renderer.render(target, _camera);
   }
+  _restoreTargetMaterial(target);
 
-  function updateCamera() {
-    _camera.left = -_bSphere.radius;
-    _camera.right = _bSphere.radius;
-    _camera.top = _bSphere.radius;
-    _camera.bottom = -_bSphere.radius;
-    _camera.zoom = cameraFactor;
-    _camera.near = 0.001;
-    _camera.far = _bSphere.radius * 2 + 0.001;
-    _camera.updateProjectionMatrix();
-  }
+  renderer.setRenderTarget(oldTarget);
+  renderer.setScissorTest(oldScissorTest);
+  renderer.setViewport(_oldViewport.x, _oldViewport.y, _oldViewport.z, _oldViewport.w);
+  renderer.setScissor(_oldScissor.x, _oldScissor.y, _oldScissor.z, _oldScissor.w);
+  renderer.setPixelRatio(oldPixelRatio);
+  renderer.setClearAlpha(oldClearAlpha);
+  return end - cellStart;
+}
 
-  function setupRenderer() {
-    const oldPixelRatio = renderer.getPixelRatio();
-    const oldScissorTest = renderer.getScissorTest();
-    const oldClearAlpha = renderer.getClearAlpha();
-    renderer.getScissor(_oldScissor);
-    renderer.getViewport(_oldViewport);
-
-    const renderTarget = new WebGLRenderTarget(atlasSize, atlasSize, { count: 2, generateMipmaps: true });
-
-    renderTarget.textures[0].minFilter = LinearMipmapLinearFilter;
-    renderTarget.textures[0].magFilter = LinearFilter;
-    renderTarget.textures[0].type = UnsignedByteType;
-    renderTarget.textures[0].colorSpace = LinearSRGBColorSpace;
-
-    renderTarget.textures[1].minFilter = NearestMipMapNearestFilter;
-    renderTarget.textures[1].magFilter = NearestFilter;
-    renderTarget.textures[1].type = UnsignedByteType;
-    renderTarget.textures[1].colorSpace = LinearSRGBColorSpace;
-
-    renderer.setRenderTarget(renderTarget);
-    renderer.setScissorTest(true);
-    renderer.setPixelRatio(1);
-    renderer.setClearAlpha(0);
-
-    return { renderTarget, oldPixelRatio, oldScissorTest, oldClearAlpha };
-  }
-
-  function restoreRenderer() {
-    renderer.setRenderTarget(null);
-    renderer.setScissorTest(oldScissorTest);
-    renderer.setViewport(_oldViewport.x, _oldViewport.y, _oldViewport.z, _oldViewport.w);
-    renderer.setScissor(_oldScissor.x, _oldScissor.y, _oldScissor.z, _oldScissor.w);
-    renderer.setPixelRatio(oldPixelRatio);
-    renderer.setClearAlpha(oldClearAlpha);
-  }
+// Wholesale one-shot atlas bake (used by the OctahedralImpostor convenience
+// class). For the runtime tier prefer createAtlasRenderTarget + renderAtlasCells
+// driven incrementally.
+// params: { renderer, target, useHemiOctahedron, textureSize?=2048,
+//           spritesPerSide?=16, cameraFactor?=1 } -> { renderTarget, albedo, normalDepth }
+export function createTextureAtlas(params) {
+  const { renderer, target, useHemiOctahedron } = params;
+  if (!renderer) throw new Error('createTextureAtlas: "renderer" is mandatory.');
+  if (!target) throw new Error('createTextureAtlas: "target" is mandatory.');
+  if (useHemiOctahedron == null) throw new Error('createTextureAtlas: "useHemiOctahedron" is mandatory.');
+  const atlasSize = params.textureSize ?? 2048;
+  const countPerSide = params.spritesPerSide ?? 16;
+  computeObjectBoundingSphere(target, _bSphere, true);
+  const renderTarget = createAtlasRenderTarget(atlasSize);
+  renderAtlasCells(renderer, target, renderTarget, {
+    atlasSize, countPerSide, bSphere: _bSphere, cameraFactor: params.cameraFactor ?? 1,
+    useHemiOctahedron, cellStart: 0, cellCount: countPerSide * countPerSide,
+  });
+  return { renderTarget, albedo: renderTarget.textures[0], normalDepth: renderTarget.textures[1] };
 }
 
 // ---------------------------------------------- impostor material patch ----
@@ -547,7 +541,10 @@ export function createOctahedralImpostorMaterial(params) {
   if (params.useHemiOctahedron == null) throw new Error('createOctahedralImpostorMaterial: useHemiOctahedron is required.');
 
   const BaseType = params.baseType ?? MeshStandardMaterial;
-  const { albedo, normalDepth } = createTextureAtlas(params);
+  // Accept a pre-baked atlas (incremental tier path) or bake one now (convenience).
+  const { albedo, normalDepth } = (params.albedo && params.normalDepth)
+    ? { albedo: params.albedo, normalDepth: params.normalDepth }
+    : createTextureAtlas(params);
 
   const material = new BaseType();
   material.isOctahedralImpostorMaterial = true;

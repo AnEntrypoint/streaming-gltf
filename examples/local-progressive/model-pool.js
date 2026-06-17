@@ -31,6 +31,7 @@ import { CachedFrustumPlanes } from './frustum-cache.js';
 import { MultiDrawOptimizer } from './multi-draw-optimizer.js';
 import { BatchedFarTier } from './batched-far-tier.js';
 import { OctahedralImpostorTier } from './octahedral-impostor-tier.js';
+import { OctahedralImpostorEzTier } from './octahedral-impostor-ez-tier.js';
 // Phase 3 Quick-Wins optimizations
 import { VertexCompressionOptimizer } from './vertex-compression.js';
 import { DrawCallSorter, buildDrawCallDescriptors, applyDrawCallSort } from './draw-call-sorter.js';
@@ -1964,6 +1965,15 @@ export class ModelPool extends Emitter {
     this._impostorBakeQueue = new Map();                      // asset.url -> entity
     this._impostorBlend = opts.impostorBlend === true;        // bilinear view cross-fade
     this._impostorPadding = opts.impostorPadding;             // cell gutter; undefined -> tier default 1.05
+    // EZ impostor path (opt-in, default off): localized @three.ez/octahedron-
+    // imposter -> LIT impostors (albedo + baked normal/depth) via a 1024 MRT
+    // atlas per asset, capped by impostorMaxAssets. Per-asset InstancedMesh
+    // (N draws for N distinct assets) vs the array-texture tier's 1-draw, traded
+    // for scene-lit quality + ~1M-tri source support. See octahedral-impostor-ez-tier.js.
+    this._useImpostorEz = opts.useImpostorEz === true;
+    this._impostorTextureSize = opts.impostorTextureSize ?? 1024;
+    this._impostorMaxAssets = opts.impostorMaxAssets ?? 64;
+    this._impostorHemiOcta = opts.impostorHemiOcta === true;
     // Eager-allocate the impostor tier at construction so its array-texture VRAM
     // allocation lands at startup, NOT on the first swap (where it was a one-shot
     // ~120ms+ frame hitch). No-op when impostors are disabled.
@@ -2593,12 +2603,19 @@ export class ModelPool extends Emitter {
     if (!this._useImpostorFinalLod) return null;
     if (!this._impostorTier) {
       if (!this.renderer || !this.scene) return null;
-      this._impostorTier = new OctahedralImpostorTier(this.renderer, {
-        grid: this._impostorGrid,
-        cellPx: this._impostorCellPx,
-        blend: this._impostorBlend,
-        padding: this._impostorPadding,
-      });
+      this._impostorTier = this._useImpostorEz
+        ? new OctahedralImpostorEzTier(this.renderer, {
+            grid: this._impostorGrid,                 // sprites per atlas side
+            textureSize: this._impostorTextureSize,   // 1024 -> ~1M-tri source models
+            maxImpostorAssets: this._impostorMaxAssets,
+            useHemiOctahedron: this._impostorHemiOcta,
+          })
+        : new OctahedralImpostorTier(this.renderer, {
+            grid: this._impostorGrid,
+            cellPx: this._impostorCellPx,
+            blend: this._impostorBlend,
+            padding: this._impostorPadding,
+          });
       this.scene.add(this._impostorTier.mesh);
     }
     return this._impostorTier;
