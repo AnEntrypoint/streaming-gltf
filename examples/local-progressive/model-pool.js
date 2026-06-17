@@ -23,6 +23,10 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 // drop-in for three's DRACOLoader that needs no .wasm fetch and no gstatic CDN.
 import { DRACOLoader } from './draco-loader.js';
 import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
+// KTX2/Basis transcoder -> decodes the single per-texture KTX2 into a GPU-
+// COMPRESSED texture (BCn/ASTC/ETC2 per device); the basis wasm is vendored at
+// ./basis/ (served locally, no CDN).
+import { KTX2Loader } from 'three/addons/loaders/KTX2Loader.js';
 import { VRMLoaderPlugin, VRMUtils } from '@pixiv/three-vrm';
 import { GlobalMaterialPool } from './material-pool.js';
 import { DeferredLoadQueue } from './deferred-load-queue.js';
@@ -40,6 +44,19 @@ import { InstanceBufferPool } from './buffer-pool.js';
 // draco.js decodes in pure JS — no decoder path / wasm to configure.
 const _sharedDracoLoader = new DRACOLoader();
 
+// Shared KTX2Loader, configured once with the renderer (detectSupport needs the
+// GL context to pick the device's compressed format). Created lazily on first
+// pool construction; _makeLoader attaches it so KHR_texture_basisu textures
+// transcode to GPU-compressed on load.
+let _sharedKtx2Loader = null;
+function _ensureKtx2Loader(renderer) {
+  if (_sharedKtx2Loader || !renderer) return _sharedKtx2Loader;
+  _sharedKtx2Loader = new KTX2Loader()
+    .setTranscoderPath(new URL('./basis/', import.meta.url).href)
+    .detectSupport(renderer);
+  return _sharedKtx2Loader;
+}
+
 // --- scratch objects (per-frame; never alloc in hot path) -----------------
 const _tmpV3 = new THREE.Vector3();
 const _tmpV3b = new THREE.Vector3();
@@ -55,6 +72,7 @@ function _makeLoader(includeVrm) {
   const l = new GLTFLoader();
   l.setMeshoptDecoder(MeshoptDecoder);
   l.setDRACOLoader(_sharedDracoLoader);
+  if (_sharedKtx2Loader) l.setKTX2Loader(_sharedKtx2Loader);
   if (includeVrm) l.register((parser) => new VRMLoaderPlugin(parser));
   return l;
 }
@@ -1938,6 +1956,10 @@ export class ModelPool extends Emitter {
     this.scene = opts.scene;
     this.renderer = opts.renderer;
     this.camera = opts.camera;
+    // Configure the shared KTX2Loader with the renderer so KHR_texture_basisu
+    // textures transcode to GPU-compressed formats on load (detectSupport needs
+    // the GL context). Done before any Asset/loader is created.
+    if (this.renderer) _ensureKtx2Loader(this.renderer);
     this.targetFps = opts.targetFps ?? 50;
     // Material Grouping Optimization: Initialize global material pool for tier-based consolidation
     this._globalMaterialPool = new GlobalMaterialPool(this.renderer, opts);

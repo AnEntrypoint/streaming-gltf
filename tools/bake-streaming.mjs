@@ -23,6 +23,23 @@ import { simplify, cloneDocument, prune, dedup } from '@gltf-transform/functions
 import { MeshoptSimplifier, MeshoptDecoder, MeshoptEncoder } from 'meshoptimizer';
 import draco3dgltf from 'draco3dgltf';
 import sharp from 'sharp';
+import { encodeToKTX2 } from 'ktx2-encoder';
+
+// One GPU-compressed KTX2 (Basis) per texture, mipmapped + downscaled. ETC1S for
+// sRGB color, UASTC for linear normal/ORM. Mirrors tools/bake-progressive.mjs.
+const MAX_TEX_SIZE = Number(process.env.BAKE_TEX_SIZE) || 1024;
+const _ktxImageDecoder = async (buf) => {
+  const { data, info } = await sharp(Buffer.from(buf)).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  return { width: info.width, height: info.height, data: new Uint8Array(data.buffer, data.byteOffset, data.byteLength) };
+};
+async function encodeTextureKTX2(srcImage, linear) {
+  const png = await sharp(Buffer.from(srcImage)).resize(MAX_TEX_SIZE, MAX_TEX_SIZE, { fit: 'inside', withoutEnlargement: true }).png().toBuffer();
+  const ktx = await encodeToKTX2(new Uint8Array(png), {
+    isUASTC: linear, needSupercompression: linear,
+    qualityLevel: linear ? undefined : 128, mipmaps: true, imageDecoder: _ktxImageDecoder,
+  });
+  return ktx instanceof Uint8Array ? ktx : new Uint8Array(ktx);
+}
 import { mkdir, writeFile, rm, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -174,27 +191,26 @@ async function main() {
     perPrimLODs.push(entry);
   }
 
-  // Step 2: bake texture LOD bytes.
+  // Step 2: encode ONE GPU-compressed KTX2 per texture (mipmapped). No webp
+  // size ladder -- the GPU mip chain handles distance. ETC1S color / UASTC linear.
   const perTexLODs = []; // [{ textureIndex, name, lods: [{ width, bytes, mime }] }]
   const textures = sourceDoc.getRoot().listTextures();
+  const linearTexIdx = new Set();
+  for (const m of sourceDoc.getRoot().listMaterials()) {
+    for (const getter of ['getNormalTexture', 'getMetallicRoughnessTexture', 'getOcclusionTexture']) {
+      const t = typeof m[getter] === 'function' ? m[getter]() : null;
+      if (t) { const i = textures.indexOf(t); if (i >= 0) linearTexIdx.add(i); }
+    }
+  }
   for (let ti = 0; ti < textures.length; ti++) {
     const tex = textures[ti];
     const name = tex.getName() || `tex_${ti}`;
     const img = tex.getImage();
     if (!img) continue;
-    const meta = await sharp(Buffer.from(img)).metadata();
-    const sizes = TEX_LOD_SIZES.filter((s) => s <= Math.max(meta.width, meta.height));
-    if (sizes.length === 0) sizes.push(Math.max(meta.width, meta.height));
-    const lods = [];
-    for (const sz of sizes) {
-      const buf = await sharp(Buffer.from(img))
-        .resize(sz, sz, { fit: 'inside', withoutEnlargement: true })
-        .webp({ quality: 82 })
-        .toBuffer();
-      lods.push({ width: sz, bytes: new Uint8Array(buf), mime: 'image/webp' });
-    }
-    perTexLODs.push({ textureIndex: ti, name, lods });
-    console.log(`[bake-streaming] tex ${ti} (${name}): ${lods.length} sizes`);
+    const linear = linearTexIdx.has(ti);
+    const ktx2 = await encodeTextureKTX2(img, linear);
+    perTexLODs.push({ textureIndex: ti, name, lods: [{ width: MAX_TEX_SIZE, bytes: ktx2, mime: 'image/ktx2' }] });
+    console.log(`[bake-streaming] tex ${ti} (${name}): KTX2 ${linear ? 'UASTC' : 'ETC1S'} @${MAX_TEX_SIZE} (${(ktx2.length / 1024).toFixed(1)} KB)`);
   }
 
   // Step 3: build the GLB JSON + binary, packing every LOD as bufferViews.
@@ -380,8 +396,20 @@ async function main() {
       name: tx.name,
     };
   });
-  // Textures array index map remains as in source; ensure each texture entry references the corresponding image index.
-  finalJson.textures = (finalJson.textures || []).map((t, i) => ({ ...t, source: i }));
+  // Textures are KTX2 (KHR_texture_basisu): reference the image via the
+  // extension's `source` (the GPU-compressed transcode path), not the core
+  // `source` (which would be a plain image). No fallback image -> required.
+  const texturesAreKtx2 = finalJson.images.some((im) => im.mimeType === 'image/ktx2');
+  finalJson.textures = (finalJson.textures || []).map((t, i) => {
+    const out = { ...t };
+    if (texturesAreKtx2) {
+      delete out.source;
+      out.extensions = { ...(out.extensions || {}), KHR_texture_basisu: { source: i } };
+    } else {
+      out.source = i;
+    }
+    return out;
+  });
 
   // Attach the streaming descriptor as a conformant glTF extension.
   // Declared in extensionsUsed (never required) so a viewer without the
@@ -452,15 +480,17 @@ async function main() {
   // JOINTS_0/WEIGHTS_0 attributes are already wired to lowest-LOD accessors
   // and the skinned-mesh runtime will rebuild them at higher LODs.
 
-  // The streaming output repacks geometry as RAW bufferViews (no draco), but
-  // finalJson inherited KHR_draco_mesh_compression in extensionsUsed/Required
-  // from the round-tripped source. Strip it so the file does not falsely
-  // declare draco required (no primitive carries the draco extension) -> stays a
-  // valid, regular-loader-openable glTF. EXT_texture_webp stays (images are webp).
-  const stripExts = new Set(['KHR_draco_mesh_compression', 'EXT_meshopt_compression']);
-  if (finalJson.extensionsRequired) finalJson.extensionsRequired = finalJson.extensionsRequired.filter((e) => !stripExts.has(e));
-  if (finalJson.extensionsUsed) finalJson.extensionsUsed = finalJson.extensionsUsed.filter((e) => !stripExts.has(e));
+  // The streaming output repacks geometry as RAW bufferViews (no draco) and
+  // textures as KTX2 (no webp), but finalJson inherited those extensions from
+  // the round-tripped source. Strip the now-false declarations so the file stays
+  // valid. Then declare KHR_texture_basisu (required: KTX2 has no fallback image).
+  const stripExts = new Set(['KHR_draco_mesh_compression', 'EXT_meshopt_compression', 'EXT_texture_webp']);
+  let usedSet = new Set((finalJson.extensionsUsed || []).filter((e) => !stripExts.has(e)));
+  let reqSet = new Set((finalJson.extensionsRequired || []).filter((e) => !stripExts.has(e)));
   if (finalJson.extensions) for (const e of stripExts) delete finalJson.extensions[e];
+  if (texturesAreKtx2) { usedSet.add('KHR_texture_basisu'); reqSet.add('KHR_texture_basisu'); }
+  finalJson.extensionsUsed = [...usedSet];
+  if (reqSet.size) finalJson.extensionsRequired = [...reqSet]; else delete finalJson.extensionsRequired;
 
   const binConcat = BufferUtils.concat(binParts);
   const glb = writeGlbBlob(finalJson, binConcat);

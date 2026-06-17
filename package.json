@@ -33,14 +33,15 @@
     "measure": "node examples/local-progressive/measure-fps.mjs"
   },
   "peerDependencies": {
-    "three": ">= 0.160.0",
-    "@pixiv/three-vrm": ">= 3.0.0"
+    "@pixiv/three-vrm": ">= 3.0.0",
+    "three": ">= 0.160.0"
   },
   "optionalDependencies": {
     "@gltf-transform/core": "^4.3.0",
     "@gltf-transform/extensions": "^4.3.0",
     "@gltf-transform/functions": "^4.3.0",
     "draco3dgltf": "^1.5.7",
+    "ktx2-encoder": "^0.5.3",
     "meshoptimizer": "^1.1.1",
     "sharp": "^0.34.5"
   },
@@ -49,6 +50,7 @@
     "@gltf-transform/extensions": "^4.3.0",
     "@gltf-transform/functions": "^4.3.0",
     "draco3dgltf": "^1.5.7",
+    "ktx2-encoder": "^0.5.3",
     "meshoptimizer": "^1.1.1",
     "playwright": "^1.60.0",
     "sharp": "^0.34.5",

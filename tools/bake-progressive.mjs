@@ -6,7 +6,8 @@
 // extension JSON that references sibling .glb / .webp files for higher LODs.
 
 import { NodeIO } from '@gltf-transform/core';
-import { ALL_EXTENSIONS } from '@gltf-transform/extensions';
+import { ALL_EXTENSIONS, KHRTextureBasisu } from '@gltf-transform/extensions';
+import { encodeToKTX2 } from 'ktx2-encoder';
 import { simplify, textureCompress, cloneDocument, prune, dedup, meshopt } from '@gltf-transform/functions';
 import { MeshoptSimplifier, MeshoptEncoder, MeshoptDecoder } from 'meshoptimizer';
 import draco3dgltf from 'draco3dgltf';
@@ -303,7 +304,39 @@ const EXTRA_LOD_STAGES = [
   { ratio: 0.04, kind: 'vertcolor' }, // very low, vertex-colored, still skinned
   { ratio: 0.01, kind: 'unskinned' }, // bind-pose, vertex-colored, no skin
 ];
-const TEX_LOD_SIZES = [2048, 1024, 512, 256, 128];
+// One copy per texture: a single GPU-compressed KTX2 (Basis) with a full mip
+// chain handles distance LOD on the GPU -- no per-size webp ladder. ETC1S for
+// sRGB color maps (heavy compression), UASTC for linear normal/ORM maps (ETC1S
+// wrecks normals). Downscaled to MAX_TEX_SIZE first (Basis encode is heavy +
+// memory-hungry at 4096; we compress a lot anyway).
+const MAX_TEX_SIZE = Number(process.env.BAKE_TEX_SIZE) || 1024;
+
+// Decode-via-sharp is REQUIRED by ktx2-encoder in Node (it can't decode webp/png
+// itself). Returns RGBA. Shared across all texture encodes.
+const _ktxImageDecoder = async (buf) => {
+  const { data, info } = await sharp(Buffer.from(buf)).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  return { width: info.width, height: info.height, data: new Uint8Array(data.buffer, data.byteOffset, data.byteLength) };
+};
+
+// Encode one texture image (any format sharp reads) -> a single mipmapped KTX2.
+// `linear` picks UASTC (normal/ORM) vs ETC1S (sRGB color).
+async function encodeTextureKTX2(srcImage, linear) {
+  const png = await sharp(Buffer.from(srcImage))
+    .resize(MAX_TEX_SIZE, MAX_TEX_SIZE, { fit: 'inside', withoutEnlargement: true })
+    .png()
+    .toBuffer();
+  const ktx = await encodeToKTX2(new Uint8Array(png), {
+    // isUASTC picks the block format: UASTC (linear normal/ORM, higher quality)
+    // vs ETC1S (sRGB color, smallest). UASTC needs Zstd supercompression to be
+    // small; ETC1S self-supercompresses (BasisLZ).
+    isUASTC: linear,
+    needSupercompression: linear,
+    qualityLevel: linear ? undefined : 128, // ETC1S size/quality knob
+    mipmaps: true,
+    imageDecoder: _ktxImageDecoder,
+  });
+  return ktx instanceof Uint8Array ? ktx : new Uint8Array(ktx);
+}
 
 // Bake a single source GLB into the progressive LOD format consumed by
 // ModelPool: writes `<outDir>/model.progressive.glb` (lowest LOD inline + a
@@ -651,40 +684,31 @@ export async function bakeProgressive(INPUT, OUT_DIR) {
     }
   }
 
-  // Stage 2: bake texture LODs.
-  const texLODs = []; // { textureIndex, name, lods: [{ width, path, bytes }] }
+  // Stage 2: encode ONE GPU-compressed KTX2 (Basis) per texture, mipmapped.
+  // No per-size webp ladder -- the GPU mip chain handles distance LOD, so
+  // streaming is geometry/vertex-only. ETC1S for sRGB color, UASTC for linear
+  // normal/ORM maps. The KTX2 is embedded in the root GLB (one copy, not streamed).
   const textures = root.listTextures();
+  // Which textures are LINEAR data (normal/metallicRoughness/occlusion) vs sRGB
+  // color (baseColor/emissive)? Linear -> UASTC; color -> ETC1S.
+  const linearTexIdx = new Set();
+  for (const m of root.listMaterials()) {
+    for (const getter of ['getNormalTexture', 'getMetallicRoughnessTexture', 'getOcclusionTexture']) {
+      const t = typeof m[getter] === 'function' ? m[getter]() : null;
+      if (t) { const i = textures.indexOf(t); if (i >= 0) linearTexIdx.add(i); }
+    }
+  }
+  const texLODs = []; // { textureIndex, name, ktx2: Uint8Array, linear, bytes }
   for (let ti = 0; ti < textures.length; ti++) {
     const tex = textures[ti];
     const name = tex.getName() || `tex_${ti}`;
     const srcImage = tex.getImage();
     if (!srcImage) continue;
-
+    const linear = linearTexIdx.has(ti);
     const meta = await sharp(Buffer.from(srcImage)).metadata();
-    console.log(`[bake] texture ${ti} (${name}): ${meta.width}x${meta.height} ${meta.format}`);
-
-    // Determine which sizes are <= source. Always include at least the smallest size.
-    const sizes = TEX_LOD_SIZES.filter((s) => s <= Math.max(meta.width, meta.height));
-    if (sizes.length === 0) sizes.push(Math.max(meta.width, meta.height));
-    // Smallest size will be inlined (replaces root texture), bigger sizes are sibling files.
-    const lodEntries = [];
-    for (const sz of sizes) {
-      const buf = await sharp(Buffer.from(srcImage))
-        .resize(sz, sz, { fit: 'inside', withoutEnlargement: true })
-        .webp({ quality: 82 })
-        .toBuffer();
-      const isSmallest = sz === sizes[sizes.length - 1];
-      if (isSmallest) {
-        lodEntries.push({ width: sz, inline: true, bytes: buf.length, buffer: buf });
-      } else {
-        const fileName = `tex_${ti}_${sz}.webp`;
-        const filePath = path.join(OUT_DIR, LODS_SUBDIR, fileName);
-        await writeFile(filePath, buf);
-        console.log(`[bake]   size=${sz} -> ${fileName} (${(buf.length/1024).toFixed(1)} KB)`);
-        lodEntries.push({ width: sz, path: `${LODS_SUBDIR}/${fileName}`, bytes: buf.length });
-      }
-    }
-    texLODs.push({ textureIndex: ti, name, lods: lodEntries });
+    const ktx2 = await encodeTextureKTX2(srcImage, linear);
+    console.log(`[bake] texture ${ti} (${name}): ${meta.width}x${meta.height} -> KTX2 ${linear ? 'UASTC' : 'ETC1S'} @${MAX_TEX_SIZE} (${(ktx2.length / 1024).toFixed(1)} KB)`);
+    texLODs.push({ textureIndex: ti, name, ktx2, linear, bytes: ktx2.length });
   }
 
   // Stage 3: build the root GLB.
@@ -724,13 +748,16 @@ export async function bakeProgressive(INPUT, OUT_DIR) {
     }
   }
 
-  // Replace textures with smallest WebP.
+  // Replace textures with the single mipmapped KTX2 (GPU-compressed). Creating
+  // the KHRTextureBasisu extension makes the writer emit texture.extensions.
+  // KHR_texture_basisu; KTX2 has no fallback image so the extension is required.
+  let basisuExt = null;
   for (const tl of texLODs) {
     const tex = rootRoot.listTextures()[tl.textureIndex];
-    const inline = tl.lods.find((x) => x.inline);
-    if (!inline) continue;
-    tex.setImage(inline.buffer);
-    tex.setMimeType('image/webp');
+    if (!tex) continue;
+    if (!basisuExt) basisuExt = rootDoc.createExtension(KHRTextureBasisu).setRequired(true);
+    tex.setImage(tl.ktx2);
+    tex.setMimeType('image/ktx2');
   }
 
   // Build the extension descriptor as extras at the root.
@@ -756,15 +783,19 @@ export async function bakeProgressive(INPUT, OUT_DIR) {
           decodeAABB: x.decodeAABB || null,
         })),
     })),
+    // Textures are now a single GPU-compressed KTX2 each, embedded in the root
+    // GLB with a full mip chain -- NOT progressively streamed. No per-size LOD
+    // ladder; the runtime loads them once via KTX2Loader and the GPU mip chain
+    // handles distance. Recorded for provenance (empty `lods` => runtime skips
+    // the texture-LOD streaming path; streaming is geometry/vertex-only).
+    textureFormat: 'ktx2-single',
     textures: texLODs.map((tl) => ({
       textureIndex: tl.textureIndex,
       name: tl.name,
-      lods: tl.lods.map((x) => ({
-        width: x.width,
-        path: x.path,
-        inline: !!x.inline,
-        bytes: x.bytes,
-      })),
+      format: 'ktx2',
+      basisMode: tl.linear ? 'UASTC' : 'ETC1S',
+      bytes: tl.bytes,
+      lods: [],
     })),
   };
 
@@ -788,11 +819,13 @@ export async function bakeProgressive(INPUT, OUT_DIR) {
   await rewriteGlbJson(rootOut, (j) => {
     j.extensions = { ...(j.extensions || {}), ...passthroughBlob, EP_progressive_lod: extPayload };
     const used = new Set([...(j.extensionsUsed || []), ...sourceExtensionsUsed, 'EP_progressive_lod']);
+    const req = new Set([...(j.extensionsRequired || []), ...sourceExtensionsRequired]);
+    // All textures are now KTX2 (KHR_texture_basisu); no webp image remains, so
+    // EXT_texture_webp would be a stale (and misleading) required declaration.
+    const hasWebp = (j.images || []).some((im) => im.mimeType === 'image/webp');
+    if (!hasWebp) { used.delete('EXT_texture_webp'); req.delete('EXT_texture_webp'); }
     j.extensionsUsed = [...used];
-    if (sourceExtensionsRequired.length) {
-      const req = new Set([...(j.extensionsRequired || []), ...sourceExtensionsRequired]);
-      j.extensionsRequired = [...req];
-    }
+    if (req.size) j.extensionsRequired = [...req];
   });
   const rootSize = (await stat(rootOut)).size;
   const origSize = (await stat(INPUT)).size;

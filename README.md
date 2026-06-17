@@ -94,6 +94,28 @@ its bare `three` import to the esm.sh URL the worker already uses, so
 Draco+meshopt sibling LODs decode off-thread too. Decoder logic is a port of
 Google Draco (Apache-2.0); the loader API mirrors three.js's `DRACOLoader` (MIT).
 
+## Textures (single GPU-compressed KTX2)
+
+Each texture is baked to **one** mipmapped **KTX2 (Basis Universal)** file
+(`KHR_texture_basisu`) -- no per-size webp ladder. Color maps use **ETC1S**
+(sRGB, smallest), normal/ORM maps use **UASTC** (linear; ETC1S wrecks normals).
+At runtime a `KTX2Loader` (transcoder vendored at
+`examples/local-progressive/basis/`, served locally) transcodes it to a
+**GPU-compressed** texture for the device (BC7/BCn on desktop, ASTC/ETC2 on
+mobile) -- witnessed `isCompressedTexture` with a 10-level mip chain. The GPU mip
+chain handles distance LOD, so **texture streaming is eliminated**: progressive
+streaming is now geometry/vertex-only. Far entities render vertex-colored
+geometry (baked to match the texture); the single KTX2 arrives with the root GLB
+for the near/textured view -- vertices first, then texture.
+
+Downscaled to `BAKE_TEX_SIZE` (default 1024; set e.g. `512` to compress harder)
+before encoding. `KHR_texture_basisu` is a standard Khronos extension, so any
+loader with a KTX2 transcoder (three, Babylon, model-viewer) opens it; it is
+declared required (KTX2 carries no fallback image), but the untextured
+geometry+vertex-color far path covers loaders without it. Encoded with
+**ktx2-encoder** (Basis); the transcoder is three.js's vendored Binomial Basis
+wasm (Apache-2.0).
+
 ## Layout
 
 - `examples/local-progressive/` — the renderer (latest). Entry: `stress.html` →
