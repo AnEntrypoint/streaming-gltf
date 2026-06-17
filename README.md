@@ -154,6 +154,27 @@ storage modes are covered by one extension, discriminated by a `storage` field:
 `single-glb-range` (all LODs packed as `bufferView` byte ranges in one GLB,
 range-fetched on demand, `bake-streaming.mjs`).
 
+### Progressive (".plod-style") load on a regular glTF
+
+`single-glb-range` is baked **coarse-first**: the base LOD (coarsest geometry +
+smallest textures) is packed immediately after the JSON chunk, and the default
+primitives/images reference it. So the one `model.streaming.glb` is a **valid
+glTF any loader opens** (it renders the coarse base; `EP_progressive_lod` is
+`extensionsUsed`, never required), AND a byte-prefix is the renderable base — a
+client can **HTTP-Range-fetch the prefix to show coarse, then range-fetch finer
+LODs as they arrive**, the progressive behaviour of a custom `.plod` stream but
+on a standard file. `examples/local-progressive/plod-gltf-stream.js` is the
+range consumer (`loadStreamingHeader` -> `streamMeshLods` coarse->fine); the dev
+server (`serve.mjs`) supports HTTP Range. Witnessed: the coarse base builds from
+~58 KB of a 362 KB file (6 range requests) without downloading the whole model.
+
+Size note: `single-glb-range` packs LOD attributes **uncompressed** (so each
+bufferView is a clean range to fetch), which is larger than the draco/meshopt
+`sibling-file` format. When download size matters more than single-file
+range-streaming, prefer `sibling-file` (the default), which also loads
+coarse-first and progressively. `single-glb-range` could adopt per-bufferView
+`EXT_meshopt_compression` to remove that size delta.
+
 - Spec + JSON Schema: [`extensions/EP_progressive_lod/`](extensions/EP_progressive_lod/README.md)
 - Conformance check: `node tools/validate-extension.mjs <model.glb>`
 

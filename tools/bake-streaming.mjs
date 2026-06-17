@@ -20,7 +20,8 @@
 import { NodeIO, BufferUtils } from '@gltf-transform/core';
 import { ALL_EXTENSIONS } from '@gltf-transform/extensions';
 import { simplify, cloneDocument, prune, dedup } from '@gltf-transform/functions';
-import { MeshoptSimplifier } from 'meshoptimizer';
+import { MeshoptSimplifier, MeshoptDecoder, MeshoptEncoder } from 'meshoptimizer';
+import draco3dgltf from 'draco3dgltf';
 import sharp from 'sharp';
 import { mkdir, writeFile, rm, stat } from 'node:fs/promises';
 import path from 'node:path';
@@ -126,8 +127,19 @@ async function main() {
 
   await mkdir(OUT_DIR, { recursive: true });
   await MeshoptSimplifier.ready;
+  await MeshoptDecoder.ready;
+  await MeshoptEncoder.ready;
 
-  const io = new NodeIO().registerExtensions(ALL_EXTENSIONS);
+  // Register decoder deps so draco/meshopt-compressed SOURCE GLBs can be read
+  // (the corpus is KHR_draco_mesh_compression; without this the read throws).
+  const io = new NodeIO()
+    .registerExtensions(ALL_EXTENSIONS)
+    .registerDependencies({
+      'draco3d.decoder': await draco3dgltf.createDecoderModule(),
+      'draco3d.encoder': await draco3dgltf.createEncoderModule(),
+      'meshopt.decoder': MeshoptDecoder,
+      'meshopt.encoder': MeshoptEncoder,
+    });
   const sourceDoc = await io.read(INPUT);
 
   // Step 1: build all LOD attribute byte arrays.
@@ -271,42 +283,64 @@ async function main() {
     });
   }
 
-  // Pack per-primitive LODs.
-  const lodMap = []; // [{ meshIndex, primIndex, lods: [{ ratio, indicesAcc, attrAccs: { POSITION: idx, ... } }] }]
-  for (const entry of perPrimLODs) {
-    const entryRecord = { meshIndex: entry.meshIndex, primIndex: entry.primIndex, lods: [] };
-    for (const lod of entry.lods) {
-      const lodRecord = { ratio: lod.ratio, attrAccs: {} };
+  // Build the LOD records WITHOUT packing yet, then pack COARSE-FIRST (level-
+  // major): level 0 = every prim's coarsest LOD + every texture's smallest LOD,
+  // packed contiguously right after the JSON chunk; finer levels follow. A
+  // byte-prefix [0 .. jsonEnd + level0 bytes] is then the complete renderable
+  // base LOD -> the GLB is .plod-style prefix-progressive while staying a valid
+  // glTF (the default primitives/images reference that level-0 base; finer LODs
+  // are extra range-fetchable bufferViews after it).
+  const lodMap = perPrimLODs.map((entry) => ({
+    meshIndex: entry.meshIndex,
+    primIndex: entry.primIndex,
+    lods: entry.lods.map((lod) => ({ ratio: lod.ratio, attrAccs: {}, _lod: lod })),
+  }));
+  const texMap = perTexLODs.map((tex) => ({
+    textureIndex: tex.textureIndex,
+    name: tex.name,
+    lods: tex.lods.map((lod) => ({ width: lod.width, _lod: lod })),
+  }));
+
+  // Assign an integer detail LEVEL per LOD (0 = base): prim by ascending ratio,
+  // texture by ascending width. Then pack all level-0 first, then level-1, ...
+  const packItems = [];
+  for (const rec of lodMap) {
+    const byRatioAsc = [...rec.lods].sort((a, b) => a.ratio - b.ratio);
+    for (const lr of rec.lods) packItems.push({ kind: 'prim', rec, lr, level: byRatioAsc.indexOf(lr) });
+  }
+  for (const rec of texMap) {
+    const byWidthAsc = [...rec.lods].sort((a, b) => a.width - b.width);
+    for (const lr of rec.lods) packItems.push({ kind: 'tex', rec, lr, level: byWidthAsc.indexOf(lr) });
+  }
+  // Stable sort by level ascending: level-0 (coarsest geom + smallest tex) first.
+  packItems.sort((a, b) => a.level - b.level);
+
+  for (const it of packItems) {
+    if (it.kind === 'prim') {
+      const lod = it.lr._lod;
       if (lod.indices) {
         const off = pushBytes(lod.indices.bytes, 4);
         const bv = addBufferView(off, lod.indices.bytes.byteLength, 34963); // ELEMENT_ARRAY_BUFFER
-        lodRecord.indicesAcc = addAccessor({
-          bufferView: bv, componentType: lod.indices.componentType, count: lod.indices.count, type: 'SCALAR'
+        it.lr.indicesAcc = addAccessor({
+          bufferView: bv, componentType: lod.indices.componentType, count: lod.indices.count, type: 'SCALAR',
         });
       }
       for (const sem of lod.semantics) {
         const attr = lod.attrs[sem];
         const off = pushBytes(attr.bytes, 4);
         const bv = addBufferView(off, attr.bytes.byteLength, 34962); // ARRAY_BUFFER
-        lodRecord.attrAccs[sem] = addAccessor({
+        it.lr.attrAccs[sem] = addAccessor({
           bufferView: bv, componentType: attr.componentType, count: attr.count, type: attr.type, min: attr.min, max: attr.max,
         });
       }
-      entryRecord.lods.push(lodRecord);
-    }
-    lodMap.push(entryRecord);
-  }
-
-  // Pack texture LODs.
-  const texMap = []; // [{ textureIndex, name, lods: [{ width, bufferView, mime, byteOffset, byteLength }] }]
-  for (const tex of perTexLODs) {
-    const rec = { textureIndex: tex.textureIndex, name: tex.name, lods: [] };
-    for (const lod of tex.lods) {
+      delete it.lr._lod;
+    } else {
+      const lod = it.lr._lod;
       const off = pushBytes(lod.bytes, 4);
       const bv = addBufferView(off, lod.bytes.byteLength);
-      rec.lods.push({ width: lod.width, bufferView: bv, mime: lod.mime, byteOffset: off, byteLength: lod.bytes.byteLength });
+      it.lr.bufferView = bv; it.lr.mime = lod.mime; it.lr.byteOffset = off; it.lr.byteLength = lod.bytes.byteLength;
+      delete it.lr._lod;
     }
-    texMap.push(rec);
   }
 
   // Build the final glTF JSON.
@@ -327,6 +361,14 @@ async function main() {
       prim.attributes[sem] = lowest.attrAccs[sem];
     }
     if (lowest.indicesAcc != null) prim.indices = lowest.indicesAcc;
+    // The attributes/indices now point at RAW (uncompressed) accessors, so drop
+    // the stale per-primitive draco extension (it referenced the old compressed
+    // bufferView) -- otherwise a loader tries to draco-decode raw data.
+    if (prim.extensions) {
+      delete prim.extensions.KHR_draco_mesh_compression;
+      delete prim.extensions.EXT_meshopt_compression;
+      if (!Object.keys(prim.extensions).length) delete prim.extensions;
+    }
   }
 
   // Rewrite each top-level texture/image to reference the smallest LOD by default.
@@ -409,6 +451,16 @@ async function main() {
   // Nodes carrying skin references stay as-is. The mesh primitive's
   // JOINTS_0/WEIGHTS_0 attributes are already wired to lowest-LOD accessors
   // and the skinned-mesh runtime will rebuild them at higher LODs.
+
+  // The streaming output repacks geometry as RAW bufferViews (no draco), but
+  // finalJson inherited KHR_draco_mesh_compression in extensionsUsed/Required
+  // from the round-tripped source. Strip it so the file does not falsely
+  // declare draco required (no primitive carries the draco extension) -> stays a
+  // valid, regular-loader-openable glTF. EXT_texture_webp stays (images are webp).
+  const stripExts = new Set(['KHR_draco_mesh_compression', 'EXT_meshopt_compression']);
+  if (finalJson.extensionsRequired) finalJson.extensionsRequired = finalJson.extensionsRequired.filter((e) => !stripExts.has(e));
+  if (finalJson.extensionsUsed) finalJson.extensionsUsed = finalJson.extensionsUsed.filter((e) => !stripExts.has(e));
+  if (finalJson.extensions) for (const e of stripExts) delete finalJson.extensions[e];
 
   const binConcat = BufferUtils.concat(binParts);
   const glb = writeGlbBlob(finalJson, binConcat);
