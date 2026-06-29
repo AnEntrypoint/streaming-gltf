@@ -110,87 +110,101 @@ export async function buildClusterLod(geo, opts = {}) {
   // packed index stream -> contiguous per cluster for GPU fetch locality).
   const lodCount = lodRatios.length;
   const remap = new Int32Array(srcVertCount).fill(-1); // old vid -> new vid
-  const newOrder = []; // new vid -> old vid
+  // new vid -> old vid; grown as a typed array (avoids boxed-number push churn on
+  // multi-million-vertex meshes). Capacity bounded by srcVertCount (no vertex is
+  // appended twice).
+  const newOrder = new Uint32Array(srcVertCount);
+  let newOrderLen = 0;
   // TWO index streams so a stock viewer drawing primitive.indices renders exactly
   // the full-res mesh: index0 = LOD0 of every cluster (-> primitive.indices);
   // indexCoarse = LOD1..N (-> a sidecar accessor referenced from extras). A
   // cluster's lods[0].offset/count index into index0; lods[1..] into indexCoarse.
-  // `stream:0|1` tags which buffer the range lives in.
-  const index0 = [];
-  const indexCoarse = [];
+  // `stream:0|1` tags which buffer the range lives in. Both are growable typed
+  // arrays (Grow) rather than JS arrays: the index streams reach millions of
+  // entries, and Array.push of boxed numbers + a trailing Uint32Array.from copy was
+  // the dominant JS cost on large meshes.
+  const index0 = new _Grow();
+  const indexCoarse = new _Grow();
   const clusters = [];
 
-  // Append `glob` (global vertex ids) to `stream`, remapping to the shared vertex
-  // table, and return {offset, count, stream:streamTag}.
-  const appendTo = (stream, streamTag, glob) => {
+  // Append `glob[0..n)` (global vertex ids) to `stream`, remapping each to the
+  // shared vertex table, and return {offset, count, stream:streamTag}.
+  const appendTo = (stream, streamTag, glob, n) => {
     const offset = stream.length;
-    for (let i = 0; i < glob.length; i++) {
+    for (let i = 0; i < n; i++) {
       const old = glob[i];
       let nv = remap[old];
       if (nv === -1) {
-        nv = newOrder.length;
+        nv = newOrderLen;
         remap[old] = nv;
-        newOrder.push(old);
+        newOrder[newOrderLen++] = old;
       }
       stream.push(nv);
     }
-    return { offset, count: glob.length, stream: streamTag };
+    return { offset, count: n, stream: streamTag };
   };
 
   const uvW = uvArr ? _uvWeights(uvAttr) : null;
+  // Reusable per-cluster scratch (clusters are <=maxVertices verts, <=maxTriangles
+  // tris, so these fixed caps never overflow). Reused across all meshlets to avoid
+  // 4 typed-array allocations per cluster.
+  const localPos = new Float32Array(maxVertices * 3);
+  const localUv = uvArr ? new Float32Array(maxVertices * 2) : null;
+  const maxLocalIdx = maxTriangles * 3;
+  const lod0LocalU32 = new Uint32Array(maxLocalIdx);
+  const glob = new Uint32Array(maxLocalIdx);
   for (let m = 0; m < mb.meshletCount; m++) {
     const mesh = C.extractMeshlet(mb, m);
     const clusterVerts = mesh.vertices; // global vertex ids in this meshlet (<=maxVertices)
 
-    // Build a COMPACT per-cluster vertex table (positions + uvs) so simplify runs
+    // Fill the COMPACT per-cluster vertex table (positions + uvs) so simplify runs
     // against tiny arrays, not the full-mesh arrays. Passing the whole 500k-vertex
     // position array per cluster per LOD is O(clusters * lods * totalVerts) and
     // pathologically slow on large meshes — local tables make each simplify O(64).
     const lv = clusterVerts.length;
-    const localPos = new Float32Array(lv * 3);
-    const localUv = uvArr ? new Float32Array(lv * 2) : null;
     for (let i = 0; i < lv; i++) {
       const g = clusterVerts[i];
       localPos[i * 3] = position[g * 3]; localPos[i * 3 + 1] = position[g * 3 + 1]; localPos[i * 3 + 2] = position[g * 3 + 2];
       if (localUv) { localUv[i * 2] = uvArr[g * 2]; localUv[i * 2 + 1] = uvArr[g * 2 + 1]; }
     }
+    const localPosV = lv === maxVertices ? localPos : localPos.subarray(0, lv * 3);
+    const localUvV = !localUv ? null : (lv === maxVertices ? localUv : localUv.subarray(0, lv * 2));
     // LOD0 as LOCAL indices (into clusterVerts); mesh.triangles are already local.
     const lod0Local = mesh.triangles; // Uint8Array of local vertex ids
-    const lod0LocalU32 = new Uint32Array(lod0Local.length);
-    for (let i = 0; i < lod0Local.length; i++) lod0LocalU32[i] = lod0Local[i];
+    const l0n = lod0Local.length;
+    for (let i = 0; i < l0n; i++) lod0LocalU32[i] = lod0Local[i];
+    const lod0LocalV = lod0LocalU32.subarray(0, l0n);
 
     const lods = [];
-    let prevLocal = lod0LocalU32;
+    let prevLocal = lod0LocalV;
     for (let l = 0; l < lodCount; l++) {
       let local;
       if (l === 0) {
-        local = lod0LocalU32;
+        local = lod0LocalV;
       } else {
-        const tRaw = Math.round(lod0LocalU32.length * lodRatios[l]);
+        const tRaw = Math.round(l0n * lodRatios[l]);
         const targetIdx = Math.max(3, tRaw - (tRaw % 3));
         if (targetIdx >= prevLocal.length) {
           local = prevLocal;
         } else {
-          const [si] = localUv
-            ? S.simplifyWithAttributes(prevLocal, localPos, 3, localUv, 2, uvW, null, targetIdx, lodError, ['LockBorder'])
-            : S.simplify(prevLocal, localPos, 3, targetIdx, lodError, ['LockBorder']);
+          const [si] = localUvV
+            ? S.simplifyWithAttributes(prevLocal, localPosV, 3, localUvV, 2, uvW, null, targetIdx, lodError, ['LockBorder'])
+            : S.simplify(prevLocal, localPosV, 3, targetIdx, lodError, ['LockBorder']);
           local = si.length >= 3 ? si : prevLocal;
         }
       }
       prevLocal = local;
-      // map local ids -> global ids for the shared-table append
-      const glob = new Uint32Array(local.length);
-      for (let i = 0; i < local.length; i++) glob[i] = clusterVerts[local[i]];
-      lods.push(l === 0 ? appendTo(index0, 0, glob) : appendTo(indexCoarse, 1, glob));
+      // map local ids -> global ids into the shared scratch, then append
+      const ln = local.length;
+      for (let i = 0; i < ln; i++) glob[i] = clusterVerts[local[i]];
+      lods.push(l === 0 ? appendTo(index0, 0, glob, ln) : appendTo(indexCoarse, 1, glob, ln));
     }
-    const lod0 = new Uint32Array(lod0Local.length);
-    for (let i = 0; i < lod0Local.length; i++) lod0[i] = clusterVerts[lod0Local[i]];
 
     const b = bounds[m];
-    // AABB from the cluster's LOD0 vertices.
+    // AABB from the cluster's LOD0 vertices (global ids via clusterVerts).
     let mnx = Infinity, mny = Infinity, mnz = Infinity, mxx = -Infinity, mxy = -Infinity, mxz = -Infinity;
-    for (let i = 0; i < lod0.length; i++) {
-      const v = lod0[i];
+    for (let i = 0; i < l0n; i++) {
+      const v = clusterVerts[lod0Local[i]];
       const x = position[v * 3], y = position[v * 3 + 1], z = position[v * 3 + 2];
       if (x < mnx) mnx = x; if (x > mxx) mxx = x;
       if (y < mny) mny = y; if (y > mxy) mxy = y;
@@ -204,25 +218,42 @@ export async function buildClusterLod(geo, opts = {}) {
   }
 
   // 4. Build the reordered unified attribute buffers in newOrder.
-  const newVertCount = newOrder.length;
+  const newVertCount = newOrderLen;
   const outAttrs = attrs.map((a) => {
     const Ctor = a.array.constructor;
-    const out = new Ctor(newVertCount * a.itemSize);
+    const src = a.array;
+    const sz = a.itemSize;
+    const out = new Ctor(newVertCount * sz);
     for (let nv = 0; nv < newVertCount; nv++) {
-      const old = newOrder[nv];
-      for (let c = 0; c < a.itemSize; c++) out[nv * a.itemSize + c] = a.array[old * a.itemSize + c];
+      const base = newOrder[nv] * sz;
+      const obase = nv * sz;
+      for (let c = 0; c < sz; c++) out[obase + c] = src[base + c];
     }
-    return { name: a.name, itemSize: a.itemSize, normalized: !!a.normalized, array: out };
+    return { name: a.name, itemSize: sz, normalized: !!a.normalized, array: out };
   });
 
   return {
     vertexCount: newVertCount,
     attributes: outAttrs,
-    index: Uint32Array.from(index0), // LOD0 of all clusters -> primitive.indices (stock full-res draw)
-    indexCoarse: Uint32Array.from(indexCoarse), // LOD1..N -> sidecar accessor referenced from extras
+    index: index0.toUint32(), // LOD0 of all clusters -> primitive.indices (stock full-res draw)
+    indexCoarse: indexCoarse.toUint32(), // LOD1..N -> sidecar accessor referenced from extras
     clusters,
     lodCount,
   };
+}
+
+// Growable Uint32 buffer: amortized O(1) push without boxed-number JS-array churn.
+class _Grow {
+  constructor(cap = 1024) { this.buf = new Uint32Array(cap); this.length = 0; }
+  push(v) {
+    if (this.length === this.buf.length) {
+      const next = new Uint32Array(this.buf.length * 2);
+      next.set(this.buf);
+      this.buf = next;
+    }
+    this.buf[this.length++] = v;
+  }
+  toUint32() { return this.buf.subarray(0, this.length).slice(); }
 }
 
 // UV weights: heavier weight = stronger penalty on collapsing edges that distort
