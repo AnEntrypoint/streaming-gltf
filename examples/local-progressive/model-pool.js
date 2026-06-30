@@ -1031,8 +1031,17 @@ class Entity extends Emitter {
           const clm = new ClusterLodMesh(cm.geometry, cm.material, cm.clusterSet, {
             lod0Count: cm.lod0Count, // live viewport height read from renderer per frame
           });
-          clm.applyMatrix4(src.matrixWorld); // keep the source node's placement
-          src.parent.add(clm);
+          // Apply the source node's placement RELATIVE to the entity root, then
+          // parent the clm under root directly -- NOT under src.parent. src.parent
+          // is the glTF node whose own TRS (e.g. a 0.03 import scale + axis-fix
+          // rotation) is ALREADY folded into src.matrixWorld; re-parenting the clm
+          // under it applied that TRS a SECOND time (0.03*0.03 squared scale +
+          // doubled rotation -> a tiny, mis-rotated model with the collider still
+          // correct). This mirrors the discrete-LOD path below (relToRoot via
+          // _rootInv) so cluster and discrete entities place identically.
+          src.updateWorldMatrix(true, false);
+          clm.applyMatrix4(new THREE.Matrix4().multiplyMatrices(_rootInv, src.matrixWorld));
+          this.root.add(clm);
           src.removeFromParent();
           // three skips onBeforeRender for empty draw ranges; keep a 3-index
           // sentinel so the hook fires and issues the real multi-draw.

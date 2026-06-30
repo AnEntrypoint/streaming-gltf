@@ -91,6 +91,22 @@ async function main() {
   }
   ok(clusterPrims >= 1, `found >=1 cluster primitive on read-back (${clusterPrims})`);
 
+  // --- source-shape guard: cluster-mode placement must not double-transform ---
+  // The cluster-ready path in model-pool.js once did clm.applyMatrix4(src.matrixWorld)
+  // then src.parent.add(clm) -- parenting the clm under the glTF node whose TRS was
+  // ALREADY folded into src.matrixWorld, applying a non-identity import scale/rotation
+  // TWICE (a 0.03 scale rendered as 0.0009; tiny mis-rotated model, collider unaffected).
+  // The discrete-LOD path uses a root-relative transform (_rootInv x matrixWorld); the
+  // cluster path must too. Assert the buggy double-parent shape is gone and the relative
+  // transform is present, the same source-shape idiom the discrete LOD bands are locked with.
+  const { readFile } = await import('node:fs/promises');
+  const mpSrc = await readFile(new URL('./examples/local-progressive/model-pool.js', import.meta.url), 'utf8');
+  const clusterReady = mpSrc.slice(mpSrc.indexOf('this.asset.clusterMeshes && this.asset.clusterMeshes.length'));
+  const clusterBody = clusterReady.slice(0, clusterReady.indexOf("this.emit('ready'"));
+  ok(!/src\.parent\.add\(clm\)/.test(clusterBody), 'cluster path does NOT parent clm under src.parent (double-transform bug)');
+  ok(/_rootInv[\s\S]*?src\.matrixWorld/.test(clusterBody) && /this\.root\.add\(clm\)/.test(clusterBody),
+    'cluster path applies root-relative transform (_rootInv x src.matrixWorld) and parents clm under this.root');
+
   await rm(OUT, { force: true });
   console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILURE(S)`);
   process.exit(failures === 0 ? 0 : 1);
