@@ -144,31 +144,10 @@ export class ClusterLodMesh extends THREE.Mesh {
     const dc = this._drawCount;
     if (dc === 0) { this.stats.multiDrawSubmissions = 0; return; }
 
-    const bpe = index.array.BYTES_PER_ELEMENT;
-    const glType = bpe === 2 ? gl.UNSIGNED_SHORT : gl.UNSIGNED_INT;
-
-    // OWN + BIND OUR ELEMENT BUFFER. This draw runs from onBeforeRender, which fires
-    // BEFORE three binds this mesh's index buffer in renderBufferDirect -- so whatever
-    // element buffer is bound here is the PREVIOUS draw's, often smaller. multiDraw with
-    // a range past that bound buffer is a GL_INVALID_OPERATION ('Insufficient buffer
-    // size') that the GL spec makes void the WHOLE call (draws nothing) and which then
-    // floods every frame until the driver caps reporting and the context degrades --
-    // on ANGLE/D3D11 the model collapses to a few stray verts and FPS tanks. Relying on
-    // three's binding here is the bug. Instead we own a GL element buffer holding this
-    // geometry's combined index and bind it ourselves; the draw ranges always fit it.
-    // Re-upload only when the index array identity or version changes (progressive LOD
-    // swap via attachClusterLod). three rebinds the geometry's own buffer for its normal
-    // draw after onBeforeRender, so we do not disturb its state beyond this mesh.
-    const arr = index.array;
-    if (this._idxBuf == null || this._idxArr !== arr || this._idxVer !== index.version) {
-      if (this._idxBuf == null) this._idxBuf = gl.createBuffer();
-      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this._idxBuf);
-      gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, arr, gl.STATIC_DRAW);
-      this._idxArr = arr;
-      this._idxVer = index.version;
-    } else {
-      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this._idxBuf);
-    }
+    // Ensure the element buffer + VAO state is bound by letting three set up the
+    // program/attributes for this mesh, then override the draw. We bind the
+    // geometry's element buffer explicitly.
+    const glType = index.array.BYTES_PER_ELEMENT === 2 ? gl.UNSIGNED_SHORT : gl.UNSIGNED_INT;
 
     if (this._ext && this._ext.multiDrawElementsWEBGL) {
       this._ext.multiDrawElementsWEBGL(gl.TRIANGLES, this._counts, 0, glType, this._starts, 0, dc);
