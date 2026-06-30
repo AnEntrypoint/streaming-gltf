@@ -18,11 +18,20 @@
 
 import { NodeIO } from '@gltf-transform/core';
 import { ALL_EXTENSIONS, EXTMeshoptCompression } from '@gltf-transform/extensions';
-import { dedup } from '@gltf-transform/functions';
+import { dedup, simplify, cloneDocument } from '@gltf-transform/functions';
 import { MeshoptEncoder, MeshoptDecoder, MeshoptSimplifier } from 'meshoptimizer';
 import draco3dgltf from 'draco3dgltf';
 import { buildClusterLod, buildClusterLodExtra, CLUSTER_LOD_EXTRA_KEY } from '../examples/local-progressive/meshlet-codec.js';
-import { writeFile } from 'node:fs/promises';
+import { writeFile, mkdir } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+
+// Discrete-LOD ratios for SKINNED/morph primitives (cluster-LOD cannot handle them
+// -- it needs static topology). meshopt simplify() preserves JOINTS_0/WEIGHTS_0 +
+// morph deltas (the simplified index is a subset of original vertices), so a skinned
+// VRM gets real LOD scaling. Lowest detail first matches the runtime sort (ascending
+// quality). 1.0 is the inline base in the root; the rest are sibling files.
+const SKINNED_LOD_RATIOS = [1.0, 0.4, 0.15];
+const EP_PROGRESSIVE_LOD_KEY = 'EP_progressive_lod';
 
 // Map a gltf-transform primitive's accessors to the meshlet-codec geo shape.
 // Attribute names are lowercased ('POSITION'->'position', 'TEXCOORD_0'->'texcoord_0')
@@ -49,6 +58,64 @@ function primToGeo(prim) {
   return { attributes, index, _semByName: Object.fromEntries(attributes.map((a) => [a.name, a._sem])) };
 }
 
+// Build discrete LOD siblings for ONE skinned primitive. Clones the document down
+// to just this primitive, meshopt-simplifies it per ratio (preserving skin attrs +
+// morphs), and writes each LOD<1.0 as a standalone sibling GLB under <outDir>/lods/.
+// Returns { meshIndex, primIndex, lods:[...] } for the EP_progressive_lod payload,
+// where exactly one entry (ratio 1.0) is inline:true (drawn from the root). The
+// runtime (model-pool.js _applyLod skinned branch) swaps the sibling geometry onto
+// the root's shared skeleton, so the sibling needs no skeleton of its own -- only
+// JOINTS_0/WEIGHTS_0 that index the same joints, which simplify() preserves.
+async function _bakeSkinnedLods(srcInput, io, meshIndex, primIndex, lodsDir, baseName) {
+  const lods = [];
+  for (const ratio of SKINNED_LOD_RATIOS) {
+    if (ratio >= 1.0) { lods.push({ ratio: 1.0, kind: 'textured', inline: true }); continue; }
+    // Fresh read+clone per ratio so each simplify starts from the full-res source
+    // (simplify is destructive; chaining ratios would compound error).
+    const doc = await io.read(srcInput);
+    const root = doc.getRoot();
+    const meshes = root.listMeshes();
+    const mesh = meshes[meshIndex];
+    if (!mesh) break;
+    const prims = mesh.listPrimitives();
+    const keepPrim = prims[primIndex];
+    if (!keepPrim) break;
+    // Strip every OTHER mesh + every other primitive so the sibling is geometry-only,
+    // single-primitive (the worker takes the first mesh it finds).
+    for (const m of meshes) {
+      for (const p of m.listPrimitives()) { if (p !== keepPrim) m.removePrimitive(p); }
+      if (m !== mesh) m.dispose();
+    }
+    const pos = keepPrim.getAttribute('POSITION');
+    if (!pos) break;
+    // decodeAABB = POSITION min/max BEFORE meshopt quantization (the worker rescales
+    // the decoded [-1,1]-ish positions back into character-local space with this).
+    const min = pos.getMinNormalized ? pos.getMin([]) : pos.getMin([]);
+    const max = pos.getMax([]);
+    const decodeAABB = { min: [min[0], min[1], min[2]], max: [max[0], max[1], max[2]] };
+    try {
+      await doc.transform(simplify({ simplifier: MeshoptSimplifier, ratio, error: 0.01, lockBorder: false }));
+    } catch (e) { continue; }
+    const idxAcc = keepPrim.getIndices();
+    const vCount = keepPrim.getAttribute('POSITION')?.getCount() || 0;
+    const iCount = idxAcc ? idxAcc.getCount() : 0;
+    if (iCount === 0 || vCount === 0) continue;   // simplified to a hole -> skip
+    // meshopt-encode the sibling at write time.
+    doc.createExtension(EXTMeshoptCompression)
+      .setRequired(true)
+      .setEncoderOptions({ method: EXTMeshoptCompression.EncoderMethod.FILTER });
+    const bin = await io.writeBinary(doc);
+    const fileName = `${baseName}_m${meshIndex}_p${primIndex}_r${String(ratio).replace('.', '')}.glb`;
+    await mkdir(lodsDir, { recursive: true });
+    await writeFile(join(lodsDir, fileName), Buffer.from(bin));
+    lods.push({ ratio, kind: 'textured', path: `lods/${fileName}`, inline: false, indexCount: iCount, vertexCount: vCount, bytes: bin.byteLength, decodeAABB });
+  }
+  // Only worth a descriptor if at least one real sibling LOD was emitted.
+  const siblingCount = lods.filter((l) => !l.inline).length;
+  if (siblingCount === 0) return null;
+  return { meshIndex, primIndex, lods };
+}
+
 async function bakeCluster(INPUT, OUTPUT) {
   await MeshoptEncoder.ready;
   await MeshoptDecoder.ready;
@@ -65,11 +132,28 @@ async function bakeCluster(INPUT, OUTPUT) {
   const root = doc.getRoot();
   const buffer = root.listBuffers()[0];
 
-  let clustered = 0, skipped = 0, totalClusters = 0;
+  let clustered = 0, skipped = 0, totalClusters = 0, skinnedLodded = 0;
   const pendingExtras = []; // { prim, result, coarseAcc } resolved after transforms
-  for (const mesh of root.listMeshes()) {
-    for (const prim of mesh.listPrimitives()) {
-      if (!primIsStatic(prim)) { skipped++; continue; }
+  const skinnedDescs = []; // EP_progressive_lod mesh descriptors (skinned discrete LODs)
+  const lodsDir = join(dirname(OUTPUT), 'lods');
+  const baseName = 'sk';
+  const allMeshes = root.listMeshes();
+  for (let mi = 0; mi < allMeshes.length; mi++) {
+    const mesh = allMeshes[mi];
+    const prims = mesh.listPrimitives();
+    for (let pi = 0; pi < prims.length; pi++) {
+      const prim = prims[pi];
+      if (!primIsStatic(prim)) {
+        // Skinned/morph: cluster-LOD can't handle it, but we still give it discrete
+        // meshopt LODs (sibling GLBs + EP_progressive_lod) so a VRM/skinned model gets
+        // real LOD scaling through ModelPool's skinned LOD ladder.
+        try {
+          const desc = await _bakeSkinnedLods(INPUT, io, mi, pi, lodsDir, baseName);
+          if (desc) { skinnedDescs.push(desc); skinnedLodded++; }
+          else skipped++;
+        } catch (e) { console.warn(`[bake-cluster] skinned LOD skipped (mesh ${mi} prim ${pi}): ${e.message}`); skipped++; }
+        continue;
+      }
       const geo = primToGeo(prim);
       if (!geo.attributes.find((a) => a.name === 'position')) { skipped++; continue; }
 
@@ -143,10 +227,51 @@ async function bakeCluster(INPUT, OUTPUT) {
     prim.setExtras(extras);
   }
 
-  const bin = await io.writeBinary(doc);
+  let bin = await io.writeBinary(doc);
+
+  // Splice the EP_progressive_lod payload (skinned discrete LODs) into the root GLB
+  // JSON chunk. gltf-transform drops unknown top-level extensions on write, so we
+  // rewrite the JSON chunk by hand. The skinned full-res mesh is already INLINE in
+  // the root (we never removed it), so each descriptor's inline:true LOD draws from
+  // the root primitive; the sibling LODs live under lods/ and are fetched on demand.
+  if (skinnedDescs.length) {
+    bin = _spliceProgressiveLod(bin, skinnedDescs);
+  }
+
   await writeFile(OUTPUT, Buffer.from(bin));
-  console.log(`[bake-cluster] ${INPUT} -> ${OUTPUT}: clustered ${clustered} prim(s), ${totalClusters} clusters, skipped ${skipped} (skinned/morph), ${(bin.byteLength / 1024).toFixed(1)} KiB`);
-  return { clustered, skipped, totalClusters, bytes: bin.byteLength };
+  console.log(`[bake-cluster] ${INPUT} -> ${OUTPUT}: clustered ${clustered} prim(s), ${totalClusters} clusters, skinned-lodded ${skinnedLodded} prim(s), skipped ${skipped}, ${(bin.byteLength / 1024).toFixed(1)} KiB`);
+  return { clustered, skipped, totalClusters, skinnedLodded, bytes: bin.byteLength };
+}
+
+// Rewrite a GLB's JSON chunk to carry extensions.EP_progressive_lod (+ list it in
+// extensionsUsed, never extensionsRequired so a stock viewer still draws the inline
+// base). The BIN chunk is copied through untouched; only the JSON chunk grows.
+function _spliceProgressiveLod(bin, meshes) {
+  const u8 = bin instanceof Uint8Array ? bin : new Uint8Array(bin);
+  const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  if (dv.getUint32(0, true) !== 0x46546c67) return bin; // not a GLB
+  const jsonLen = dv.getUint32(12, true);
+  const json = JSON.parse(new TextDecoder().decode(u8.subarray(20, 20 + jsonLen)));
+  json.extensions = json.extensions || {};
+  json.extensions[EP_PROGRESSIVE_LOD_KEY] = { version: 1, storage: 'sibling-file', meshes };
+  const used = new Set(json.extensionsUsed || []);
+  used.add(EP_PROGRESSIVE_LOD_KEY);
+  json.extensionsUsed = [...used];
+  let nj = JSON.stringify(json);
+  while (nj.length % 4 !== 0) nj += ' ';
+  const jb = new TextEncoder().encode(nj);
+  const binChunkStart = 20 + jsonLen;
+  const binChunkLen = dv.getUint32(binChunkStart, true);
+  const binChunkType = dv.getUint32(binChunkStart + 4, true);
+  const binData = u8.subarray(binChunkStart + 8, binChunkStart + 8 + binChunkLen);
+  const total = 12 + 8 + jb.length + 8 + binData.length;
+  const out = new Uint8Array(total);
+  const odv = new DataView(out.buffer);
+  odv.setUint32(0, 0x46546c67, true); odv.setUint32(4, 2, true); odv.setUint32(8, total, true);
+  odv.setUint32(12, jb.length, true); odv.setUint32(16, 0x4e4f534a, true); out.set(jb, 20);
+  let o = 20 + jb.length;
+  odv.setUint32(o, binData.length, true); odv.setUint32(o + 4, binChunkType, true); out.set(binData, o + 8);
+  return out;
 }
 
 function _glType(n) {
