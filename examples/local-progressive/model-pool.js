@@ -1043,9 +1043,15 @@ class Entity extends Emitter {
           clm.applyMatrix4(new THREE.Matrix4().multiplyMatrices(_rootInv, src.matrixWorld));
           this.root.add(clm);
           src.removeFromParent();
-          // three skips onBeforeRender for empty draw ranges; keep a 3-index
-          // sentinel so the hook fires and issues the real multi-draw.
-          cm.geometry.setDrawRange(0, 3);
+          // Draw the FULL index range. ClusterLodMesh.onBeforeRender populates
+          // geometry GROUPS (the per-cluster visible LOD sub-ranges) each frame and
+          // lets three's normal pipeline draw them with the correct VAO; three only
+          // draws groups that fall within drawRange, so drawRange must span the whole
+          // index. (The old 3-index sentinel paired with the previous custom multi-draw
+          // hook -- which is gone; a clamped drawRange now hides almost all geometry and
+          // also breaks Mesh.raycast, which is bounded by drawRange.) The default full
+          // range still fires onBeforeRender (three only skips it for a zero-count range).
+          cm.geometry.setDrawRange(0, Infinity);
           this.clusterMeshes.push(clm);
         }
         this.emit('ready', this);

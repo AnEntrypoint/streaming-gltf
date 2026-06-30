@@ -86,16 +86,8 @@ export class ClusterLodMesh extends THREE.Mesh {
   }
 
   _render(renderer, scene, camera, geometry) {
-    if (!this._extProbed) {
-      const gl = renderer.getContext();
-      this._ext = gl.getExtension('WEBGL_multi_draw') || gl.getExtension('ANGLE_multi_draw') || null;
-      this.stats.ext = this._ext ? 'WEBGL_multi_draw' : 'none';
-      this._extProbed = true;
-    }
-
     const index = geometry.index;
     if (!index || !this.clusterSet) return; // nothing to do; default draw renders full LOD0
-    const bytesPerIndex = index.array.BYTES_PER_ELEMENT;
 
     _projScreen.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
     _frustum.setFromProjectionMatrix(_projScreen);
@@ -113,53 +105,36 @@ export class ClusterLodMesh extends THREE.Mesh {
       Math.hypot(me[8], me[9], me[10])
     );
 
-    let dc = 0, drawnTris = 0, visible = 0;
+    // GEOMETRY GROUPS (not a custom multiDraw). onBeforeRender runs BEFORE three binds this mesh's
+    // VAO, so a custom gl draw here ran with the wrong/stale element+vertex state -> GL_INVALID
+    // 'Insufficient buffer size' storms on strict drivers (ANGLE/D3D11: context degrades, FPS
+    // collapse) and, when it drew, wrong normals/uvs + collapsed verts. Instead we declare which
+    // index sub-ranges to draw as geometry GROUPS and let three's NORMAL pipeline draw them: three
+    // sets up the full correct VAO and issues one drawElements per group, with correct attributes,
+    // no double-draw, no extra buffers, and Mesh.raycast still works (it walks the full index, not
+    // groups). Each group uses materialIndex 0 (single material). Per-cluster LOD selection by
+    // projected size is preserved; an empty group set falls back to drawing the full index (LOD0).
+    geometry.clearGroups();
+    let drawnTris = 0, visible = 0;
     const clusters = this.clusterSet.clusters;
     for (let ci = 0; ci < clusters.length; ci++) {
       const c = clusters[ci];
-      // world-space sphere
       _sphere.center.set(c.sphere[0], c.sphere[1], c.sphere[2]).applyMatrix4(this.matrixWorld);
       _sphere.radius = c.sphere[3] * scale;
-      if (!_frustum.intersectsSphere(_sphere)) continue;
+      if (!this._spointNoClusterCull && !_frustum.intersectsSphere(_sphere)) continue;
       visible++;
       const dist = Math.max(1e-3, _sphere.center.distanceTo(camPos));
       const projSize = (sh * _sphere.radius) / (dist * tanHalf);
       const lodIdx = this._pickLod(ci, projSize);
       const lod = c.lods[lodIdx];
       if (!lod.count) continue;
-      this._starts[dc] = this._byteOffset(lod, bytesPerIndex);
-      this._counts[dc] = lod.count;
+      const base = lod.stream === 1 ? this.lod0Count : 0;     // start in ELEMENTS (groups use element offsets)
+      geometry.addGroup(base + lod.offset, lod.count, 0);
       drawnTris += lod.count / 3;
-      dc++;
     }
-    this._drawCount = dc;
     this.stats.visibleClusters = visible;
     this.stats.drawnTris = drawnTris;
-
-    this._draw(renderer, geometry, index);
-  }
-
-  _draw(renderer, geometry, index) {
-    const gl = renderer.getContext();
-    const dc = this._drawCount;
-    if (dc === 0) { this.stats.multiDrawSubmissions = 0; return; }
-
-    // Ensure the element buffer + VAO state is bound by letting three set up the
-    // program/attributes for this mesh, then override the draw. We bind the
-    // geometry's element buffer explicitly.
-    const glType = index.array.BYTES_PER_ELEMENT === 2 ? gl.UNSIGNED_SHORT : gl.UNSIGNED_INT;
-
-    if (this._ext && this._ext.multiDrawElementsWEBGL) {
-      this._ext.multiDrawElementsWEBGL(gl.TRIANGLES, this._counts, 0, glType, this._starts, 0, dc);
-      this.stats.multiDrawSubmissions = 1;
-    } else if (this._ext && this._ext.multiDrawElementsANGLE) {
-      this._ext.multiDrawElementsANGLE(gl.TRIANGLES, this._counts, 0, glType, this._starts, 0, dc);
-      this.stats.multiDrawSubmissions = 1;
-    } else {
-      // Fallback: per-range drawElements loop.
-      for (let i = 0; i < dc; i++) gl.drawElements(gl.TRIANGLES, this._counts[i], glType, this._starts[i]);
-      this.stats.multiDrawSubmissions = dc;
-    }
+    this.stats.multiDrawSubmissions = geometry.groups.length;
   }
 }
 
