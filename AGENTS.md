@@ -62,3 +62,5 @@ real GLB through `bakeCluster` and asserts the format invariants via a real
 gltf-transform + meshoptimizer read-back (LOD0-sum == `primitive.indices`, all
 ranges in-bounds and multiple-of-3, stream tagging, coarse accessor count,
 EXT_meshopt_compression present, no draco). Keep it mock-free and <=200 lines.
+
+@.gm/next-step.md

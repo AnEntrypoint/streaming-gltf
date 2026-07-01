@@ -15,11 +15,13 @@ See [AGENTS.md](AGENTS.md) for the format (`EP_cluster_lod` extras +
 
 **https://anentrypoint.github.io/streaming-gltf/** — the stress demo, deployed
 from `examples/local-progressive/` by `.github/workflows/deploy-pages.yml`. It
-ships code only: `three` loads from a CDN (importmap) and the baked models are
-streamed **cross-origin** from the assets host
-(`https://anentrypoint.github.io/assets/`, derived from its
-`manifest.baked.json`). Override the asset source with `?assets=<baseUrl>`, or
-use `?assets=local` with the dev server (`npm run demo:local`).
+ships code only: `three` loads from a CDN (importmap) and the cluster-LOD models
+are streamed **cross-origin** from the assets host
+(`https://anentrypoint.github.io/assets/`), discovered from its unified
+`manifest.json` (`{Category:[{name,path,thumb}]}`, `path =
+streaming-cluster/<name>.cluster.glb`). Override the asset source with
+`?assets=<baseUrl>`, or `?assets=local` with the dev server (`npm run demo:local`,
+which serves the sibling `../assets/streaming-cluster` corpus under `/cluster/`).
 
 ## SDK usage
 

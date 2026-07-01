@@ -5,30 +5,30 @@ import * as THREE from 'three';
 import { ModelPool } from './model-pool.js';
 import { enableDrawCallBatching } from './draw-call-batching.js';
 
-// Asset source. By default the baked models are loaded CROSS-ORIGIN from the
-// public assets host (its own GitHub Pages site) so this repo ships code only —
-// no model bytes, no LFS. Override with ?assets=<baseUrl>, or ?assets=local to
-// use the dev server's generated /assets-list.json + relative output_* paths
-// (npm run demo:local). ASSET_DIRS ends up holding FULLY-RESOLVED .glb URLs.
+// Asset source. By default the cluster-LOD models are loaded CROSS-ORIGIN from
+// the public assets host (its own GitHub Pages site) so this repo ships code only
+// — no model bytes, no LFS. Override with ?assets=<baseUrl>, or ?assets=local to
+// use the dev server's generated /assets-list.json. ASSET_DIRS ends up holding
+// FULLY-RESOLVED .cluster.glb URLs (each renders via the model-pool cluster path).
 const _assetsParam = new URLSearchParams(location.search).get('assets');
 const ASSET_HOST_DEFAULT = 'https://anentrypoint.github.io/assets/';
 const ASSET_BASE = (!_assetsParam || _assetsParam === 'remote')
   ? ASSET_HOST_DEFAULT
   : (_assetsParam === 'local' ? null : (_assetsParam.endsWith('/') ? _assetsParam : _assetsParam + '/'));
 
-let ASSET_DIRS = []; // fully-resolved model.progressive.glb URLs
+let ASSET_DIRS = []; // fully-resolved .cluster.glb URLs
 const ASSET_DIRS_READY = (ASSET_BASE === null
-  // LOCAL DEV: dynamic /assets-list.json from serve.mjs -> relative glb paths.
+  // LOCAL DEV: dynamic /assets-list.json from serve.mjs -> relative cluster paths.
   ? fetch('/assets-list.json').then((r) => r.json())
-      .then((list) => list.map((dir) => `${dir}/model.progressive.glb`))
-  // REMOTE: the assets host's manifest.baked.json (category -> [{baked,...}]).
-  // Flatten and resolve each `baked` (streaming/output_xxx/model.progressive.glb)
-  // against ASSET_BASE so models stream cross-origin.
-  : fetch(`${ASSET_BASE}manifest.baked.json`).then((r) => r.json())
+      .then((list) => list.map((p) => (typeof p === 'string' ? p : p.path)))
+  // REMOTE: the assets host's unified manifest.json (category -> [{name,path,thumb}]),
+  // where path = streaming-cluster/<name>.cluster.glb. Flatten + resolve each path
+  // against ASSET_BASE so the cluster models stream cross-origin.
+  : fetch(`${ASSET_BASE}manifest.json`).then((r) => r.json())
       .then((manifest) => Object.values(manifest).flat()
-        .map((e) => e && e.baked).filter(Boolean)
-        .map((baked) => ASSET_BASE + baked)))
-  .then((urls) => { ASSET_DIRS = urls; console.log(`[stress] ${urls.length} assets discovered (${ASSET_BASE || 'local'})`); return urls; })
+        .map((e) => e && e.path).filter(Boolean)
+        .map((path) => ASSET_BASE + path)))
+  .then((urls) => { ASSET_DIRS = urls; console.log(`[stress] ${urls.length} cluster assets discovered (${ASSET_BASE || 'local'})`); return urls; })
   .catch((e) => { console.error('[stress] asset list fetch failed', e); ASSET_DIRS = []; });
 
 const canvas = document.getElementById('c');
