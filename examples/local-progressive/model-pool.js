@@ -2573,6 +2573,26 @@ export class ModelPool extends Emitter {
     }
   }
 
+  // Set an entity's ROTATION (quaternion [x,y,z,w]) and refresh its rendered transform
+  // on every tier. setTarget()/the far-tier GPU lerp interpolate POSITION only, so without
+  // this a networked physics/kinematic body's rotation never reaches the pool render (the
+  // consumer sees a body that translates but never turns). Writing root.quaternion here and
+  // re-deriving every tracked mesh's slot matrix from _slotWorldMatrix(tm) (which reads the
+  // full root TRS) carries rotation to the hero/mid Object3D tier AND the batched/instanced
+  // far tier. Rotation is snapped (authoritative server quat at the snapshot rate); position
+  // keeps its own smooth lerp, so a small rotation step per snapshot reads as continuous.
+  setRotation(entity, qx, qy, qz, qw) {
+    if (!entity || entity._disposed || !entity.root) return;
+    entity.root.quaternion.set(qx, qy, qz, qw);
+    entity.root.updateMatrix();
+    entity.root.updateMatrixWorld(true);
+    for (const tm of entity.trackedMeshes) {
+      if (tm._instancedSlot && tm._instancedSlotIdx != null && tm._instancedSlotIdx >= 0) {
+        tm._instancedSlot.setMatrixForSlot(tm._instancedSlotIdx, entity._slotWorldMatrix(tm));
+      }
+    }
+  }
+
   // Per-frame: interpolate only entities with an active target. O(active set).
   // Completed movers are removed and left resting at their target. Called once
   // per frame from update().
