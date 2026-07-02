@@ -39,14 +39,30 @@ VRM players keep their own path).
 holds the unified geometry (LOD0 + coarse concatenated into one element buffer) and
 the parsed cluster set. Its `onBeforeRender` each frame: frustum-culls clusters by
 bounding sphere, picks a LOD per visible cluster by projected screen size (with
-hysteresis), and draws all chosen index ranges in a SINGLE `WEBGL_multi_draw`
-call (per-range `drawElements` fallback when the extension is absent). A 3-index
-sentinel `drawRange` keeps three issuing `onBeforeRender`.
+hysteresis), and declares the chosen index ranges as geometry GROUPS -- three's
+normal pipeline then issues one `drawElements` per group with the correct VAO/
+attributes (NOT a raw `WEBGL_multi_draw` call: `onBeforeRender` fires before three
+binds the VAO, so a manual multi-draw there hit stale buffer state -- see the
+inline comment in `_render()`). `drawRange` is left at the full index span so an
+empty group set still falls back to drawing the complete LOD0.
 
 `model-pool.js` detects `EP_cluster_lod` at asset load, prepares the cluster
 geometry once, and each spawned `Entity` renders a `ClusterLodMesh` — bypassing
 the discrete-LOD machinery entirely (`trackedMeshes` stays empty; `_update` is a
 no-op for cluster entities; the per-cluster LOD self-drives off the camera).
+
+`examples/local-progressive/occlusion-query-tier.js` `OcclusionQueryTier`
+(opt-in via `new ModelPool({..., useOcclusionQuery: true})`) adds entity-level
+"cull each other" culling on top of per-cluster frustum culling: WebGL2 native
+`ANY_SAMPLES_PASSED_CONSERVATIVE` query objects test each frustum-visible
+entity's bounding box against the real depth buffer, one frame of latency
+(query issued frame N, resolved+applied frame N+1 to avoid a GPU sync stall).
+The app must call `pool.runOcclusionQueries()` once per frame AFTER
+`renderer.render(scene, camera)` (needs that frame's real depth buffer as the
+occluder source). Fail-open: an entity with no resolved verdict yet stays
+visible. A previously-occluded entity stays a query candidate forever (its
+LOD/distance work is skipped while hidden, but it keeps getting re-tested) so
+a moving/disappearing occluder doesn't leave it permanently hidden.
 
 ## Bake the corpus
 

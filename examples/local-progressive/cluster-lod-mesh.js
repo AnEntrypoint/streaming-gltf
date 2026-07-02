@@ -5,10 +5,16 @@
 // metadata parsed from extras.EP_cluster_lod. Each frame it:
 //   1. frustum-culls clusters by their bounding sphere (CPU),
 //   2. picks a LOD per visible cluster from projected screen size,
-//   3. accumulates the chosen index sub-ranges, and
-//   4. issues them via WEBGL/ANGLE_multi_draw in a SINGLE draw call against the
-//      unified element buffer (falls back to a per-range drawElements loop, or to
-//      a plain full-LOD0 draw, when the extension is absent).
+//   3. accumulates the chosen index sub-ranges as geometry GROUPS, and
+//   4. lets three's normal render pipeline issue one drawElements call PER
+//      GROUP against the unified element buffer. NOT a raw WEBGL_multi_draw
+//      call: three's object.onBeforeRender (where this class hooks in) fires
+//      BEFORE renderBufferDirect binds the mesh's VAO, so a manual gl draw
+//      here would run against stale/wrong buffer state (see _render()'s
+//      inline comment for the GL_INVALID failure mode this replaced). Groups
+//      still land in ONE render pass with correct attributes and no extra
+//      buffers or double-draws -- just not collapsed into a single GPU
+//      submission the way a true multi-draw extension call would.
 //
 // The whole index buffer = LOD0 of every cluster, so if this object is ever drawn
 // by the stock three pipeline (no onBeforeRender override applied) it still renders

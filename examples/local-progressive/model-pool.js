@@ -43,6 +43,7 @@ import { MultiDrawOptimizer } from './multi-draw-optimizer.js';
 import { BatchedFarTier } from './batched-far-tier.js';
 import { OctahedralImpostorTier } from './octahedral-impostor-tier.js';
 import { OctahedralImpostorEzTier } from './octahedral-impostor-ez-tier.js';
+import { OcclusionQueryTier } from './occlusion-query-tier.js';
 // Phase 3 Quick-Wins optimizations
 import { VertexCompressionOptimizer } from './vertex-compression.js';
 import { DrawCallSorter, buildDrawCallDescriptors, applyDrawCallSort } from './draw-call-sorter.js';
@@ -289,9 +290,10 @@ class InstancedSlot {
       this._uniforms.instanceTex = { value: tex };
       this._uniforms.instanceTexWidth = { value: this._instTexWidth };
     }
-    // Dirty-range tracking for partial uploads (min..max texel column touched).
-    this._instTexDirtyLo = Infinity;
-    this._instTexDirtyHi = -1;
+    // Dirty-range tracking for partial uploads: a SORTED SET of disjoint [loCol,hiCol]
+    // texel-column runs touched since the last flush (see setInstanceTransform/flushInstanceTexture
+    // for why this replaced a single min..max span).
+    this._instTexDirtyRuns = [];
   }
   // Write one instance's mat4 into its 4 texels. Marks only that instance's
   // column range dirty — a single model move costs one 4-texel write here.
@@ -307,9 +309,22 @@ class InstancedSlot {
       this._instTexData[o + 2] = e[m + 2];
       this._instTexData[o + 3] = e[m + 3];
     }
-    const loCol = idx * 4, hiCol = idx * 4 + 3;
-    if (loCol < this._instTexDirtyLo) this._instTexDirtyLo = loCol;
-    if (hiCol > this._instTexDirtyHi) this._instTexDirtyHi = hiCol;
+    this._markInstanceTexDirty(idx * 4, idx * 4 + 3);
+  }
+  // Insert [loCol,hiCol] into the sorted disjoint-run list, merging with any overlapping/adjacent
+  // run so the list stays O(distinct touched regions) rather than growing one entry per instance.
+  _markInstanceTexDirty(loCol, hiCol) {
+    const runs = this._instTexDirtyRuns;
+    let i = 0;
+    while (i < runs.length && runs[i][1] < loCol - 1) i++;
+    let mergedLo = loCol, mergedHi = hiCol;
+    let j = i;
+    while (j < runs.length && runs[j][0] <= hiCol + 1) {
+      if (runs[j][0] < mergedLo) mergedLo = runs[j][0];
+      if (runs[j][1] > mergedHi) mergedHi = runs[j][1];
+      j++;
+    }
+    runs.splice(i, j - i, [mergedLo, mergedHi]);
   }
   // Upload only the touched texel columns via THREE's addUpdateRange (three>=0.159) instead of a
   // full-width needsUpdate re-upload every frame something moved. PERF (2026-07-02, spoint consumer
@@ -318,18 +333,24 @@ class InstancedSlot {
   // (capacity*4 texels) on every frame ANY tracked entity moved, even when only one instance's 4-texel
   // range actually changed. addUpdateRange narrows the GPU upload to the byte-exact dirty span
   // (start/count are in COMPONENTS: RGBAFormat = 4 components/texel, so texel range [lo,hi] ->
-  // component range [lo*4, (hi-lo+1)*4]). Static frames still upload nothing (dirtyHi<0 guard
-  // unchanged); a moving-entity frame now uploads O(moved instances) bytes instead of O(capacity) bytes.
+  // component range [lo*4, (hi-lo+1)*4]).
+  //
+  // FOLLOW-UP FIX (2026-07-02i): the original version tracked a single min..max SPAN across all
+  // dirty instances in a frame. When co-moving entities land at scattered pool slot indices (the
+  // normal case — slot assignment is allocation-order, not spatial/temporal locality), that span
+  // silently widens to cover nearly the whole texture, degrading back to a near-full-width upload
+  // with no signal that the "partial" path stopped helping. Now tracks a merged list of disjoint
+  // dirty runs and issues one addUpdateRange per run, so N scattered movers upload O(N) texels
+  // instead of O(capacity) texels regardless of how spread out their slot indices are.
   flushInstanceTexture() {
-    if (this._instTexDirtyHi >= 0) {
-      const lo = this._instTexDirtyLo, hi = this._instTexDirtyHi;
+    const runs = this._instTexDirtyRuns;
+    if (runs.length > 0) {
       if (typeof this._instTex.addUpdateRange === 'function') {
         this._instTex.clearUpdateRanges();
-        this._instTex.addUpdateRange(lo * 4, (hi - lo + 1) * 4);
+        for (const [lo, hi] of runs) this._instTex.addUpdateRange(lo * 4, (hi - lo + 1) * 4);
       }
       this._instTex.needsUpdate = true;
-      this._instTexDirtyLo = Infinity;
-      this._instTexDirtyHi = -1;
+      runs.length = 0;
     }
   }
   _grow(newCap) {
@@ -1845,6 +1866,7 @@ class Entity extends Emitter {
       if (tm.vcMaterial) tm.vcMaterial.dispose();
     }
     this.trackedMeshes = [];
+    if (this.pool._occlusionTier) this.pool._occlusionTier.release(this);
     this.pool._entities.delete(this);
     this.emit('disposed', this);
   }
@@ -2085,6 +2107,14 @@ export class ModelPool extends Emitter {
     // assets). One rung past the BatchedFarTier. See octahedral-impostor-tier.js.
     this._useImpostorFinalLod = opts.useImpostorFinalLod === true;
     this._impostorTier = null;
+    // GPU occlusion-query culling (opt-in, default off): entities that are
+    // in-frustum but hidden behind other geometry (walls, dense neighbors)
+    // skip their draw. WebGL2-native (ANY_SAMPLES_PASSED_CONSERVATIVE query
+    // objects), no compute shaders. Only worth enabling above minOcclusionCandidates
+    // entities/frame — the per-entity query submission has its own cost.
+    this._useOcclusionQuery = opts.useOcclusionQuery === true;
+    this._occlusionTier = null;
+    this._occlusionMinCandidates = opts.occlusionMinCandidates ?? 64;
     this._impostorPx = opts.impostorPx ?? 14;       // enter impostor below this px
     this._impostorGrid = opts.impostorGrid ?? 8;
     this._impostorCellPx = opts.impostorCellPx ?? 64;
@@ -2750,6 +2780,40 @@ export class ModelPool extends Emitter {
 
   // Lazily build the shared octahedral impostor tier and attach its single
   // InstancedMesh to the scene. Null if impostors are disabled or unsupported.
+  // App-facing: call ONCE per frame AFTER renderer.render(scene, camera) so
+  // occlusion queries read against this frame's real depth buffer. Results
+  // are read back and applied starting NEXT frame's update() (see the
+  // occlusion gate at the top of the entity loop above) — one frame of
+  // latency, standard for GPU occlusion query culling, avoids a sync stall.
+  // No-op when useOcclusionQuery is off or the candidate count is below
+  // occlusionMinCandidates (query submission overhead isn't worth it for a
+  // handful of entities that frustum culling already handles cheaply).
+  runOcclusionQueries() {
+    if (!this._useOcclusionQuery) return;
+    const tier = this._getOcclusionTier();
+    if (!tier) return;
+    const candidates = this._occlusionCandidates;
+    if (!candidates || candidates.length < this._occlusionMinCandidates) return;
+    tier.runQueries(this.camera, candidates);
+  }
+
+  _getOcclusionTier() {
+    if (!this._useOcclusionQuery) return null;
+    if (!this._occlusionTier) {
+      if (!this.renderer) return null;
+      this._occlusionTier = new OcclusionQueryTier(this.renderer, {
+        minCandidates: this._occlusionMinCandidates,
+      });
+      if (!this._occlusionTier.supported()) {
+        // No WebGL2 occlusion query support (e.g. WebGL1 fallback context) —
+        // degrade to frustum-only culling silently, never a hard failure.
+        this._occlusionTier = null;
+        this._useOcclusionQuery = false;
+      }
+    }
+    return this._occlusionTier;
+  }
+
   _getImpostorTier() {
     if (!this._useImpostorFinalLod) return null;
     if (!this._impostorTier) {
@@ -3125,12 +3189,40 @@ export class ModelPool extends Emitter {
     let n = 0;
     const stream = this._enableDeferredStreaming;
     if (stream) this._lodUnloadManager.resetVisibility();
+    // Occlusion tier (opt-in): entities its LAST resolved query found fully
+    // hidden are skipped here before frustum/LOD work runs — same shape as
+    // the frustum early-return above, so an occluded entity costs almost
+    // nothing per frame beyond the map lookup. Occlusion is a strict subset
+    // of "invisible" (an occluded entity is necessarily off-screen from the
+    // viewer's perspective too), so gating before _update is correct: the
+    // entity's OWN root.visible stays whatever frustum culling would have
+    // set, but we skip its LOD/distance bookkeeping entirely when occluded.
+    const occTier = this._useOcclusionQuery ? this._getOcclusionTier() : null;
+    this._occlusionCandidates = this._occlusionCandidates || [];
+    this._occlusionCandidates.length = 0;
     for (const e of this._entities) {
       if (e._disposed) continue;
+      if (occTier && occTier.isOccluded(e)) {
+        if (e.root.visible) e.root.visible = false;
+        if (stream) this._lodUnloadManager.markInvisible(e);
+        // MUST stay a query candidate even while hidden: the occluding
+        // geometry can move/disappear next frame (a wall sliding away, the
+        // occluder itself getting culled), and this is the ONLY path that
+        // re-tests and un-hides it. Dropping it from candidates here would
+        // make occlusion a one-way, permanent hide -- worse than no culling
+        // at all. The candidate test itself is a cheap bounding-box query,
+        // not the entity's full LOD/distance/animation work, which IS still
+        // skipped below via continue.
+        this._occlusionCandidates.push(e);
+        continue; // fully occluded last frame — skip LOD/distance work this frame
+      }
       if (e.root.matrixAutoUpdate || e._boundDirty) movingCount++;
       const result = e._update(this.camera, vh, dt, this._currentCeilingLod, this._frustum, this.animationThrottleDistance);
       const { distance, screenPx } = result;
-      if (screenPx > 0) visible++;
+      if (screenPx > 0) {
+        visible++;
+        if (occTier) this._occlusionCandidates.push(e);
+      }
       if (distance < Infinity) {
         ents[n] = e; dists[n] = distance; n++;
       }
@@ -3309,6 +3401,7 @@ export class ModelPool extends Emitter {
       if (this._deferredLoadQueue) stats.deferredLoading = this._deferredLoadQueue.getStats();
       if (this._lodUnloadManager) stats.unloadManager = this._lodUnloadManager.getStats();
       if (this._multiDrawOptimizer) stats.multiDraw = this._multiDrawOptimizer.getStats();
+      if (this._occlusionTier) stats.occlusion = this._occlusionTier.stats;
     }
     return stats;
   }
