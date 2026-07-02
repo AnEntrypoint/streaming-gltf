@@ -311,12 +311,22 @@ class InstancedSlot {
     if (loCol < this._instTexDirtyLo) this._instTexDirtyLo = loCol;
     if (hiCol > this._instTexDirtyHi) this._instTexDirtyHi = hiCol;
   }
-  // Upload only the touched texel columns. THREE's DataTexture lacks a public
-  // partial-upload API on all paths, so we flag needsUpdate (full re-upload of
-  // a width*1 row — cheap: capacity*4 texels) only when something actually
-  // changed this frame. Static frames upload nothing.
+  // Upload only the touched texel columns via THREE's addUpdateRange (three>=0.159) instead of a
+  // full-width needsUpdate re-upload every frame something moved. PERF (2026-07-02, spoint consumer
+  // 144fps investigation): a live stack-trace CDP profile traced texSubImage2D — a top-3 live-frame
+  // cost — to three's uploadTexture->setTexture2D re-uploading this ENTIRE _instTexWidth-wide row
+  // (capacity*4 texels) on every frame ANY tracked entity moved, even when only one instance's 4-texel
+  // range actually changed. addUpdateRange narrows the GPU upload to the byte-exact dirty span
+  // (start/count are in COMPONENTS: RGBAFormat = 4 components/texel, so texel range [lo,hi] ->
+  // component range [lo*4, (hi-lo+1)*4]). Static frames still upload nothing (dirtyHi<0 guard
+  // unchanged); a moving-entity frame now uploads O(moved instances) bytes instead of O(capacity) bytes.
   flushInstanceTexture() {
     if (this._instTexDirtyHi >= 0) {
+      const lo = this._instTexDirtyLo, hi = this._instTexDirtyHi;
+      if (typeof this._instTex.addUpdateRange === 'function') {
+        this._instTex.clearUpdateRanges();
+        this._instTex.addUpdateRange(lo * 4, (hi - lo + 1) * 4);
+      }
       this._instTex.needsUpdate = true;
       this._instTexDirtyLo = Infinity;
       this._instTexDirtyHi = -1;
