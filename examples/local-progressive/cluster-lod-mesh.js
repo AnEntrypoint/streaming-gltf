@@ -23,6 +23,13 @@ const _projScreen = new THREE.Matrix4();
 const _v = new THREE.Vector3();
 const _size = new THREE.Vector2();
 
+// Per-frame cache of the camera-only inputs shared by every ClusterLodMesh instance drawn in the
+// same renderer.render() call: projScreen/frustum/camPos/screen-height/tanHalf depend only on
+// (renderer, camera), not on this.matrixWorld, so N instances recomputing them per frame is pure
+// waste. Keyed on renderer.info.render.frame -- camera/renderer state cannot change between
+// onBeforeRender calls within one render() pass.
+let _camCache = { renderer: null, camera: null, frame: -1, sh: 1080, tanHalf: 1 };
+
 // thresholds: projected sphere radius (px-ish, screenH * r / dist) above which a
 // given LOD is used. Index i is chosen when projected size > thresholds[i].
 // Descending: big on screen -> LOD0, small -> coarsest.
@@ -50,6 +57,11 @@ export class ClusterLodMesh extends THREE.Mesh {
 
     this._ext = null;
     this._extProbed = false;
+    // Pooled geometry.groups objects -- mutated in place each frame instead of clearGroups()+
+    // addGroup() reallocating one {start,count,materialIndex} object per visible cluster per frame.
+    // _groupPool is the growable backing store (objects never discarded); _groupView is the
+    // per-frame slice handed to three (a fresh array each frame, but its elements are pooled objects).
+    this._groupPool = [];
 
     // Live stats for the browser witness.
     this.stats = { visibleClusters: 0, drawnTris: 0, totalTris: 0, multiDrawSubmissions: 0, ext: null };
@@ -89,15 +101,22 @@ export class ClusterLodMesh extends THREE.Mesh {
     const index = geometry.index;
     if (!index || !this.clusterSet) return; // nothing to do; default draw renders full LOD0
 
-    _projScreen.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
-    _frustum.setFromProjectionMatrix(_projScreen);
-    const camPos = camera.getWorldPosition(_v.copy(camera.position));
-    // Live viewport height from the renderer's drawing buffer (falls back to the
-    // constructor value) so projected-size LOD thresholds track the real canvas.
-    let sh = this._screenHeight;
-    try { const sz = renderer.getDrawingBufferSize(_size); if (sz.y > 0) sh = sz.y; } catch (_) {}
-    // fov-based projection scale (perspective): projSize ~= sh * r / (dist * tan(fov/2)).
-    const tanHalf = camera.isPerspectiveCamera ? Math.tan(THREE.MathUtils.degToRad(camera.fov) * 0.5) : 1;
+    // Camera-only inputs (projScreen/frustum/camPos/screen-height/tanHalf) are identical for every
+    // ClusterLodMesh drawn in this render() pass -- recompute once per frame, not once per instance.
+    const frame = renderer.info.render.frame;
+    if (_camCache.renderer !== renderer || _camCache.camera !== camera || _camCache.frame !== frame) {
+      _projScreen.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+      _frustum.setFromProjectionMatrix(_projScreen);
+      _v.setFromMatrixPosition(camera.matrixWorld); // camera.matrixWorld is already current inside onBeforeRender; avoids getWorldPosition's redundant parent-chain re-update+decompose
+      // Live viewport height from the renderer's drawing buffer (falls back to the
+      // constructor value) so projected-size LOD thresholds track the real canvas.
+      let sh = this._screenHeight;
+      try { const sz = renderer.getDrawingBufferSize(_size); if (sz.y > 0) sh = sz.y; } catch (_) {}
+      const tanHalf = camera.isPerspectiveCamera ? Math.tan(THREE.MathUtils.degToRad(camera.fov) * 0.5) : 1;
+      _camCache.renderer = renderer; _camCache.camera = camera; _camCache.frame = frame;
+      _camCache.camPos = _v.clone(); _camCache.sh = sh; _camCache.tanHalf = tanHalf;
+    }
+    const camPos = _camCache.camPos, sh = _camCache.sh, tanHalf = _camCache.tanHalf;
     const me = this.matrixWorld.elements;
     const scale = Math.max(
       Math.hypot(me[0], me[1], me[2]),
@@ -114,8 +133,8 @@ export class ClusterLodMesh extends THREE.Mesh {
     // no double-draw, no extra buffers, and Mesh.raycast still works (it walks the full index, not
     // groups). Each group uses materialIndex 0 (single material). Per-cluster LOD selection by
     // projected size is preserved; an empty group set falls back to drawing the full index (LOD0).
-    geometry.clearGroups();
-    let drawnTris = 0, visible = 0;
+    let drawnTris = 0, visible = 0, n = 0;
+    const pool = this._groupPool;
     const clusters = this.clusterSet.clusters;
     for (let ci = 0; ci < clusters.length; ci++) {
       const c = clusters[ci];
@@ -129,9 +148,18 @@ export class ClusterLodMesh extends THREE.Mesh {
       const lod = c.lods[lodIdx];
       if (!lod.count) continue;
       const base = lod.stream === 1 ? this.lod0Count : 0;     // start in ELEMENTS (groups use element offsets)
-      geometry.addGroup(base + lod.offset, lod.count, 0);
+      let g = pool[n];
+      if (!g) { g = pool[n] = { start: 0, count: 0, materialIndex: 0 }; }
+      g.start = base + lod.offset; g.count = lod.count; g.materialIndex = 0;
+      n++;
       drawnTris += lod.count / 3;
     }
+    // Hand three a view sized to this frame's drawn count; the backing pool objects are never
+    // discarded (pool.length is untouched), so a future frame that needs MORE groups reuses them.
+    const view = this._groupView || (this._groupView = []);
+    view.length = n;
+    for (let i = 0; i < n; i++) view[i] = pool[i];
+    geometry.groups = view;
     this.stats.visibleClusters = visible;
     this.stats.drawnTris = drawnTris;
     this.stats.multiDrawSubmissions = geometry.groups.length;
