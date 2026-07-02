@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>webgpu occlusion tier witness</title></head>
+<body style="margin:0">
+<canvas id="c" style="width:100vw;height:100vh;display:block"></canvas>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.184.0/build/three.module.js",
+  "three/webgpu": "https://cdn.jsdelivr.net/npm/three@0.184.0/build/three.webgpu.js",
+  "three/tsl": "https://cdn.jsdelivr.net/npm/three@0.184.0/build/three.tsl.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.184.0/examples/jsm/",
+  "@pixiv/three-vrm": "https://cdn.jsdelivr.net/npm/@pixiv/three-vrm@3.4.0/lib/three-vrm.module.min.js"
+} }
+</script>
+<script type="module">
+// Real-execution witness for WebGpuHizTier (webgpu-hiz-tier.js). Constructs
+// a WebGPURenderer, spawns two cluster-LOD models -- one in front of, one
+// behind, an opaque wall occluder -- and exercises the tier's full lifecycle
+// (construct/detect/bind/dispatch/readback/isOccluded/release/dispose).
+//
+// The depth-comparison KERNEL is currently disabled/fail-open (see
+// webgpu-hiz-tier.js's inline comment): the dispatch/readback plumbing is
+// verified working against a real device, but the texel-coordinate math has
+// an unresolved bug (diag.frontSampledDepth/behindSampledDepth come back
+// near-identical despite a raw pixel readback of the same depth texture
+// showing real spatial variation). window.__results.diag exposes the raw
+// numbers for the next debugging pass.
+
+import * as THREE from 'three/webgpu';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
+import { WebGpuHizTier } from './webgpu-hiz-tier.js';
+
+window.__errors = [];
+window.addEventListener('error', (e) => window.__errors.push(String(e.error || e.message)));
+window.__results = {};
+
+(async () => {
+  const canvas = document.getElementById('c');
+  const renderer = new THREE.WebGPURenderer({ canvas, antialias: false });
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  await renderer.init();
+  window.__renderer = renderer;
+  window.__results.initOk = true;
+  window.__results.backendIsWebGPU = !!(renderer.backend && renderer.backend.isWebGPUBackend);
+
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 500);
+  camera.position.set(0, 1, 25);
+  camera.lookAt(0, 0, -30);
+
+  const wall = new THREE.Mesh(new THREE.BoxGeometry(20, 20, 1), new THREE.MeshBasicMaterial({ color: 0x888888 }));
+  wall.position.set(0, 0, 10);
+  scene.add(wall);
+
+  const loader = new GLTFLoader();
+  loader.setMeshoptDecoder(MeshoptDecoder);
+  const loadGLB = (url) => new Promise((res, rej) => loader.load(url, (g) => res(g.scene), undefined, rej));
+
+  const url = new URLSearchParams(location.search).get('glb') || './cluster-test.glb';
+  const front = await loadGLB(url); // in front of wall -> visible
+  front.position.set(0, 0, 15);
+  front.scale.setScalar(6);
+  scene.add(front);
+
+  const behind = await loadGLB(url); // behind wall -> occluded (once the kernel is fixed)
+  behind.position.set(0, 0, -5);
+  behind.scale.setScalar(6);
+  scene.add(behind);
+
+  window.__results.assetsLoaded = true;
+  window.__results.sceneChildCount = scene.children.length;
+
+  const tier = new WebGpuHizTier(renderer, { minCandidates: 1 });
+  window.__tier = tier;
+  window.__results.tierSupported = tier.supported();
+
+  const frontEntity = { root: front };
+  const behindEntity = { root: behind };
+
+  let frame = 0;
+  async function tick() {
+    requestAnimationFrame(tick);
+    frame++;
+    renderer.render(scene, camera);
+    if (frame === 20 && tier.supported() && !window.__depthBound) {
+      // Explicit render target WITH a depth texture, so bindDepthTexture()
+      // has a real GPUTexture to sample -- three's implicit default target
+      // does not expose its depth texture directly.
+      const size = new THREE.Vector2();
+      renderer.getDrawingBufferSize(size);
+      const rt = new THREE.RenderTarget(size.x, size.y, { depthBuffer: true });
+      rt.depthTexture = new THREE.DepthTexture(size.x, size.y, THREE.FloatType);
+      window.__depthRT = rt;
+      window.__depthBound = true;
+      renderer.setRenderTarget(rt);
+      renderer.render(scene, camera);
+      renderer.setRenderTarget(null);
+      tier.bindDepthTexture(rt.depthTexture);
+    }
+    if (frame > 20 && tier.supported()) {
+      tier.runQueries(camera, [frontEntity, behindEntity]);
+    }
+    if (frame === 90) {
+      window.__results.frontOccluded = tier.isOccluded(frontEntity);
+      window.__results.behindOccluded = tier.isOccluded(behindEntity);
+      window.__results.stats = { ...tier.stats };
+      const fi = tier._records.get(frontEntity), bi = tier._records.get(behindEntity);
+      window.__results.diag = {
+        frontIdx: fi, behindIdx: bi,
+        frontAabb: [...tier._aabbCPU.slice(fi * 4, fi * 4 + 4)],
+        behindAabb: [...tier._aabbCPU.slice(bi * 4, bi * 4 + 4)],
+        frontDepth: tier._candDepthCPU[fi], behindDepth: tier._candDepthCPU[bi],
+        texSize: tier._texSizeUniform ? tier._texSizeUniform.value.toArray() : null,
+        frontSampledDepth: tier._debugCPU ? tier._debugCPU[fi] : null,
+        behindSampledDepth: tier._debugCPU ? tier._debugCPU[bi] : null,
+      };
+      if (renderer.readRenderTargetPixelsAsync) {
+        try {
+          const rt = window.__depthRT;
+          const px1 = await renderer.readRenderTargetPixelsAsync(rt, Math.floor(rt.width * 0.5), Math.floor(rt.height * 0.3), 1, 1);
+          const px2 = await renderer.readRenderTargetPixelsAsync(rt, Math.floor(rt.width * 0.5), Math.floor(rt.height * 0.7), 1, 1);
+          window.__results.rawDepthProbe = { center: Array.from(px1), lower: Array.from(px2) };
+        } catch (e) {
+          window.__results.rawDepthProbeErr = String(e);
+        }
+      }
+      window.__witnessReady = true;
+    }
+  }
+  tick();
+})().catch((e) => { window.__errors.push('init: ' + String(e)); window.__witnessReady = true; });
+</script>
+</body>
+</html>

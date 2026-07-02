@@ -44,6 +44,15 @@ import { BatchedFarTier } from './batched-far-tier.js';
 import { OctahedralImpostorTier } from './octahedral-impostor-tier.js';
 import { OctahedralImpostorEzTier } from './octahedral-impostor-ez-tier.js';
 import { OcclusionQueryTier } from './occlusion-query-tier.js';
+// WebGpuHizTier is dynamic-imported (see _getOcclusionTier) rather than
+// statically imported here: it depends on 'three/tsl', a subpath most
+// existing demo pages' importmaps don't map (they only import 'three' for
+// the plain WebGLRenderer path) -- a static import here broke every
+// WebGL2-only demo page with "Failed to resolve module specifier three/tsl"
+// even though those pages never construct a WebGPURenderer and never need
+// this tier at all. Deferring the import until useOcclusionQuery is actually
+// enabled AND the renderer looks like a WebGPURenderer keeps the WebGL2 path
+// fully independent of the WebGPU tier's dependencies.
 // Phase 3 Quick-Wins optimizations
 import { VertexCompressionOptimizer } from './vertex-compression.js';
 import { DrawCallSorter, buildDrawCallDescriptors, applyDrawCallSort } from './draw-call-sorter.js';
@@ -2107,11 +2116,15 @@ export class ModelPool extends Emitter {
     // assets). One rung past the BatchedFarTier. See octahedral-impostor-tier.js.
     this._useImpostorFinalLod = opts.useImpostorFinalLod === true;
     this._impostorTier = null;
-    // GPU occlusion-query culling (opt-in, default off): entities that are
+    // GPU occlusion culling (opt-in, default off): entities that are
     // in-frustum but hidden behind other geometry (walls, dense neighbors)
-    // skip their draw. WebGL2-native (ANY_SAMPLES_PASSED_CONSERVATIVE query
-    // objects), no compute shaders. Only worth enabling above minOcclusionCandidates
-    // entities/frame — the per-entity query submission has its own cost.
+    // skip their draw. Auto-picks a backend off the renderer: WebGL2-native
+    // occlusion queries (ANY_SAMPLES_PASSED_CONSERVATIVE, occlusion-query-tier.js)
+    // for a WebGLRenderer, or a WebGPU compute-based tier (webgpu-hiz-tier.js,
+    // currently fail-open scaffolding pending real-hardware witnessing -- see
+    // that file's header) for a WebGPURenderer with a real WebGPU backend.
+    // Only worth enabling above minOcclusionCandidates entities/frame — the
+    // per-entity query submission has its own cost.
     this._useOcclusionQuery = opts.useOcclusionQuery === true;
     this._occlusionTier = null;
     this._occlusionMinCandidates = opts.occlusionMinCandidates ?? 64;
@@ -2799,11 +2812,66 @@ export class ModelPool extends Emitter {
 
   _getOcclusionTier() {
     if (!this._useOcclusionQuery) return null;
+    // A WebGPURenderer path is loaded via dynamic import() ONLY when the
+    // renderer actually looks like one (cheap sync flag check, no module
+    // load) -- so a WebGL2-only page (the overwhelming majority of this
+    // repo's demos) never pulls in webgpu-hiz-tier.js or its 'three/tsl'
+    // dependency at all. The import is async; until it resolves,
+    // _getOcclusionTier() returns null (fail-open: no occlusion culling
+    // that frame, exactly like "unsupported") rather than blocking the
+    // synchronous entity-loop caller.
+    if (this.renderer && this.renderer.isWebGPURenderer && !this._occlusionTier && !this._webgpuTierLoading) {
+      this._webgpuTierLoading = true;
+      import('./webgpu-hiz-tier.js').then(({ WebGpuHizTier }) => {
+        this._webgpuTierLoading = false;
+        if (!this._useOcclusionQuery || this._occlusionTier) return; // opted out or a tier already assigned while loading
+        const gpuTier = new WebGpuHizTier(this.renderer, { minCandidates: this._occlusionMinCandidates });
+        if (gpuTier.supported()) {
+          this._occlusionTier = gpuTier;
+        } else {
+          // WebGPU tier construction reported unsupported on a renderer that
+          // DID pass the isWebGPURenderer check -- this can happen if the
+          // backend fell back internally after construction. Do NOT fall
+          // back to OcclusionQueryTier here: it calls renderer.getContext()
+          // expecting a WebGL2RenderingContext, which a WebGPURenderer does
+          // not expose the same way, and its own supported()===false would
+          // then permanently disable _useOcclusionQuery for a renderer that
+          // might still recover. Leave _occlusionTier null and retry next
+          // frame instead (matches the "no tier yet" fail-open contract).
+        }
+      }).catch((err) => {
+        this._webgpuTierLoading = false;
+        if (typeof console !== 'undefined') console.warn('[model-pool] webgpu-hiz-tier.js dynamic import failed:', err);
+        // Import failed (e.g. the page's importmap has no 'three/tsl').
+        // Only fall back to the WebGL2 OcclusionQueryTier if the renderer
+        // is NOT a WebGPURenderer -- on an actual WebGPURenderer that path
+        // cannot work (see note above) and would just disable occlusion
+        // culling entirely via a false supported() reading.
+        if (this._useOcclusionQuery && !this._occlusionTier && this.renderer && !this.renderer.isWebGPURenderer) {
+          this._occlusionTier = new OcclusionQueryTier(this.renderer, { minCandidates: this._occlusionMinCandidates });
+          if (!this._occlusionTier.supported()) { this._occlusionTier = null; this._useOcclusionQuery = false; }
+        }
+      });
+      return null; // this frame: no tier yet, caller no-ops (fail-open)
+    }
+    // WebGPURenderer path: either the dynamic import above is still in
+    // flight (this._webgpuTierLoading true — return null, fail-open this
+    // frame, the .then()/.catch() will assign a tier once it settles) or it
+    // already failed/produced null for a reason logged there. Either way,
+    // NEVER fall through to constructing OcclusionQueryTier against a
+    // WebGPURenderer below -- that tier's constructor calls
+    // renderer.getContext() expecting a WebGL2RenderingContext, which a
+    // WebGPURenderer doesn't provide the same way, so supported() reads
+    // false and the bug this fixes is: that false permanently disabled
+    // _useOcclusionQuery even though the REAL WebGPU tier might still load
+    // successfully a moment later.
+    if (this.renderer && this.renderer.isWebGPURenderer) return this._occlusionTier;
     if (!this._occlusionTier) {
       if (!this.renderer) return null;
-      this._occlusionTier = new OcclusionQueryTier(this.renderer, {
-        minCandidates: this._occlusionMinCandidates,
-      });
+      // Plain WebGLRenderer (the common case): WebGL2 occlusion-query tier,
+      // no dynamic import needed -- it's a normal static dependency of this
+      // file already.
+      this._occlusionTier = new OcclusionQueryTier(this.renderer, { minCandidates: this._occlusionMinCandidates });
       if (!this._occlusionTier.supported()) {
         // No WebGL2 occlusion query support (e.g. WebGL1 fallback context) —
         // degrade to frustum-only culling silently, never a hard failure.
