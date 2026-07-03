@@ -202,11 +202,16 @@ class InstancedSlot {
     this.mesh = new THREE.InstancedMesh(geo, material, this.capacity);
     this.mesh.frustumCulled = false; // GPU vertex-shader handles culling
     this.mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-    // Per-instance world-space bounding sphere (cx, cy, cz, r). Set on
+    // Per-instance world-space bounding-sphere RADIUS only (r). The center is
+    // always exactly the instance's own matrix translation column (verified:
+    // every write site below passes me[12..14] straight from the instance's
+    // world matrix, never an offset center) so the vertex shader derives it
+    // from instanceMatrix[3].xyz / readInstanceMatrix(...)[3].xyz instead of
+    // carrying a redundant xyz here — 4x smaller attribute + upload. Set on
     // slot acquire / update; the vertex shader reads this and collapses
     // out-of-frustum instances to NaN.
-    this._boundArray = new Float32Array(this.capacity * 4);
-    this._boundAttr = new THREE.InstancedBufferAttribute(this._boundArray, 4);
+    this._boundArray = new Float32Array(this.capacity);
+    this._boundAttr = new THREE.InstancedBufferAttribute(this._boundArray, 1);
     this._boundAttr.setUsage(THREE.DynamicDrawUsage);
     this.mesh.geometry.setAttribute('instanceBoundSphere', this._boundAttr);
     // Dirty-range tracking for the bound-sphere attribute, mirroring the instance
@@ -252,8 +257,7 @@ class InstancedSlot {
     }
     // Zero the bound-sphere radius so the shader treats this slot as
     // "no bound info" → also drawn at origin (zero matrix). Belt+braces.
-    const o = idx * 4;
-    this._boundArray[o] = 0; this._boundArray[o+1] = 0; this._boundArray[o+2] = 0; this._boundArray[o+3] = 0;
+    this._boundArray[idx] = 0;
     this._markBoundDirty(idx);
   }
   setMatrixForSlot(idx, matrix) {
@@ -282,19 +286,18 @@ class InstancedSlot {
       this._dirtySlots.clear();
     }
   }
-  setBoundSphereForSlot(idx, cx, cy, cz, r) {
-    const o = idx * 4;
-    this._boundArray[o] = cx;
-    this._boundArray[o+1] = cy;
-    this._boundArray[o+2] = cz;
-    this._boundArray[o+3] = r;
+  // Center is intentionally NOT stored here — it is always the instance's own
+  // matrix translation, which the vertex shader already has via instanceMatrix
+  // / the instance transform texture. Only the radius is CPU-tracked.
+  setBoundSphereForSlot(idx, r) {
+    this._boundArray[idx] = r;
     this._markBoundDirty(idx);
   }
   // Insert instance idx's touched component range into a merged disjoint-run
   // list (identical shape to _markInstanceTexDirty) so N scattered per-frame
   // movers upload O(N) components instead of O(capacity) components.
   _markBoundDirty(idx) {
-    const loComp = idx * 4, hiComp = loComp + 3;
+    const loComp = idx, hiComp = idx;
     const runs = this._boundDirtyRuns;
     let i = 0;
     while (i < runs.length && runs[i][1] < loComp - 1) i++;
@@ -432,11 +435,11 @@ class InstancedSlot {
       next.instanceMatrix.needsUpdate = true;
     }
     next.count = old.count;
-    // Grow + carry the per-instance bound-sphere attribute.
-    const newBounds = new Float32Array(newCap * 4);
+    // Grow + carry the per-instance bound-sphere radius attribute.
+    const newBounds = new Float32Array(newCap);
     newBounds.set(this._boundArray);
     this._boundArray = newBounds;
-    this._boundAttr = new THREE.InstancedBufferAttribute(newBounds, 4);
+    this._boundAttr = new THREE.InstancedBufferAttribute(newBounds, 1);
     this._boundAttr.setUsage(THREE.DynamicDrawUsage);
     next.geometry.setAttribute('instanceBoundSphere', this._boundAttr);
     this._boundDirtyRuns = []; // fresh attribute object, no pending partial-range upload to carry
@@ -478,7 +481,7 @@ function _patchInstancedSlotMaterial(material, uniforms) {
       .replace(
         '#include <common>',
         `#include <common>
-attribute vec4 instanceBoundSphere;
+attribute float instanceBoundSphere;
 uniform mat4 projViewMatrix;
 uniform vec4 frustumPlanes[6];
 #ifdef USE_GPU_INSTANCE_TEX
@@ -502,10 +505,13 @@ mat4 readInstanceMatrix(int id) {
   // instance data texture (by gl_InstanceID) instead of the instanceMatrix
   // attribute. mvPosition is declared at outer scope (exactly like the stock
   // <project_vertex> chunk) so downstream chunks that read it still compile.
-  vec4 mvPosition = modelViewMatrix * readInstanceMatrix(gl_InstanceID) * vec4(transformed, 1.0);
+  mat4 instMat = readInstanceMatrix(gl_InstanceID);
+  vec4 mvPosition = modelViewMatrix * instMat * vec4(transformed, 1.0);
   gl_Position = projectionMatrix * mvPosition;
+  vec3 instCenter = instMat[3].xyz;
 #else
   #include <project_vertex>
+  vec3 instCenter = instanceMatrix[3].xyz;
 #endif
 {
   // GPU per-instance frustum cull.
@@ -515,9 +521,13 @@ mat4 readInstanceMatrix(int id) {
   // normalizing an already-unit vector. Also removed the dead lodLutTexture
   // fetch + vLodIndex varying: LOD selection happens CPU-side, the varying
   // was written but never read by any fragment shader.)
-  if (instanceBoundSphere.w > 0.0) {
-    vec3 c = instanceBoundSphere.xyz;
-    float r = instanceBoundSphere.w;
+  // Center is NOT a separate attribute: it is always exactly the instance's
+  // own model-matrix translation column, read directly from whichever
+  // transform path is active above (verified CPU-side: every JS write site
+  // passes the instance's own worldMat translation, never an offset center).
+  if (instanceBoundSphere > 0.0) {
+    vec3 c = instCenter;
+    float r = instanceBoundSphere;
     bool outside = false;
     for (int i = 0; i < 6; i++) {
       vec4 p = frustumPlanes[i];
@@ -1310,10 +1320,9 @@ class Entity extends Emitter {
           tm._matrixNeedsUpdate = false;
           const sphere = geo.boundingSphere;
           if (sphere) {
-            const me = worldMat.elements;
             const scale = _maxAbsScale(this.root.scale);
             tm._instancedBoundRadius = sphere.radius;
-            slot.setBoundSphereForSlot(tm._instancedSlotIdx, me[12], me[13], me[14], sphere.radius * scale);
+            slot.setBoundSphereForSlot(tm._instancedSlotIdx, sphere.radius * scale);
           }
         }
         tm.currentLod = wantIdx;
@@ -1761,10 +1770,9 @@ class Entity extends Emitter {
           tm._matrixNeedsUpdate = false;
         }
         if (!this._subPixelCulled && movable && tm._instancedBoundRadius != null) {
-          const me = (slotWM || this._slotWorldMatrix(tm)).elements;
           const scale = _maxAbsScale(this.root.scale);
           tm._instancedSlot.setBoundSphereForSlot(
-            tm._instancedSlotIdx, me[12], me[13], me[14],
+            tm._instancedSlotIdx,
             tm._instancedBoundRadius * scale,
           );
         }
