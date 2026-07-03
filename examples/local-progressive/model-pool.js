@@ -81,6 +81,15 @@ const _tmpSphere = new THREE.Sphere();
 const _zeroMatrix = new THREE.Matrix4().set(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0);
 const _identityMatrix = new THREE.Matrix4(); // default = identity
 
+// Tight, correct bounding-radius scale multiplier for a (possibly non-uniform)
+// scale vector: max(|sx|,|sy|,|sz|). A uniform scale s previously computed via
+// scale.length()/Math.SQRT2 yielded ~1.22s (22% over-inflated bound, wasted
+// cull efficiency); a strongly non-uniform scale like (2,0.1,0.1) yielded
+// ~1.42, UNDER-estimating the true extent (2) -- an actual false-cull bug.
+function _maxAbsScale(scale) {
+  return Math.max(Math.abs(scale.x), Math.abs(scale.y), Math.abs(scale.z));
+}
+
 // --- shared GLTFLoaders ---------------------------------------------------
 // Two flavors: one with the VRM plugin (root loads), one without (sibling
 // LOD loads — the siblings carry no VRM extension blob, and the plugin's
@@ -1302,7 +1311,7 @@ class Entity extends Emitter {
           const sphere = geo.boundingSphere;
           if (sphere) {
             const me = worldMat.elements;
-            const scale = this.root.scale.length() / Math.SQRT2;
+            const scale = _maxAbsScale(this.root.scale);
             tm._instancedBoundRadius = sphere.radius;
             slot.setBoundSphereForSlot(tm._instancedSlotIdx, me[12], me[13], me[14], sphere.radius * scale);
           }
@@ -1515,8 +1524,8 @@ class Entity extends Emitter {
     // (Removed an unused `world.distanceTo(camera.position)` here — it computed
     // a sqrt for every entity every frame and its result was never read; the
     // distance actually used is computed once below, after the frustum test.)
-    const scaleLen = this.root.scale.length();
-    const radius = sphere.radius * scaleLen / Math.SQRT2;
+    const scaleLen = _maxAbsScale(this.root.scale);
+    const radius = sphere.radius * scaleLen;
     // Skip frustum check + LOD if we're MUCH closer than necessary OR much
     // farther than we can resolve. The frustum test itself is moderately
     // expensive (matrix-vs-sphere per plane).
@@ -1753,7 +1762,7 @@ class Entity extends Emitter {
         }
         if (!this._subPixelCulled && movable && tm._instancedBoundRadius != null) {
           const me = (slotWM || this._slotWorldMatrix(tm)).elements;
-          const scale = this.root.scale.length() / Math.SQRT2;
+          const scale = _maxAbsScale(this.root.scale);
           tm._instancedSlot.setBoundSphereForSlot(
             tm._instancedSlotIdx, me[12], me[13], me[14],
             tm._instancedBoundRadius * scale,
@@ -1854,9 +1863,10 @@ class Entity extends Emitter {
       return false;
     }
     // Compose the world billboard placement from the asset-local descriptor and
-    // this entity's transform (uniform-scale factor = |scale| / √3).
+    // this entity's transform (bounding-safe scale factor = max(|sx|,|sy|,|sz|),
+    // tight and correct for both uniform and non-uniform scale).
     const wc = _tmpV3b.copy(desc.center).applyMatrix4(this.root.matrixWorld);
-    const s = this.root.scale.length() / 1.7320508; // √3
+    const s = _maxAbsScale(this.root.scale);
     const wr = desc.radius * s;
     if (!this._impostorActive) {
       this._setTrackedDrawsHidden(true);
