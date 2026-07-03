@@ -65,6 +65,13 @@ export class OctahedralImpostorTier {
     this._layerAttr = new THREE.InstancedBufferAttribute(new Float32Array(this.maxInstances), 1);
     this._layerAttr.setUsage(THREE.DynamicDrawUsage);
     geo.setAttribute('aLayer', this._layerAttr);
+    // Per-instance center+radius as a single vec4, replacing a full mat4
+    // (instanceMatrix) that only ever had its translation (center) and column-0
+    // length (radius) read back out in the shader. 4 floats/instance instead of
+    // 16 — same dirty-range-tracked-upload fix class as _layerAttr/InstancedSlot.
+    this._centerRadiusAttr = new THREE.InstancedBufferAttribute(new Float32Array(this.maxInstances * 4), 4);
+    this._centerRadiusAttr.setUsage(THREE.DynamicDrawUsage);
+    geo.setAttribute('aCenterRadius', this._centerRadiusAttr);
 
     const material = new THREE.ShaderMaterial({
       glslVersion: THREE.GLSL3,
@@ -82,14 +89,15 @@ export class OctahedralImpostorTier {
         ${OCT_GLSL}
         in vec2 corner;
         in float aLayer;
+        in vec4 aCenterRadius;
         uniform float uGrid;
         out vec2 vUv;
         out vec2 vCellBase;
         out vec2 vEnc;
         out float vLayer;
         void main() {
-          vec3 center = instanceMatrix[3].xyz;
-          float radius = length(instanceMatrix[0].xyz);
+          vec3 center = aCenterRadius.xyz;
+          float radius = aCenterRadius.w;
           vec3 viewDir = normalize(cameraPosition - center);
           vec2 enc = octEncode(viewDir);
           vEnc = enc;
@@ -157,16 +165,17 @@ export class OctahedralImpostorTier {
     this.mesh.frustumCulled = false; // pool gates impostor LOD by distance already
     this.mesh.count = 0;
     this.mesh.name = 'octahedral-impostor-tier';
-    this.mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    // instanceMatrix is unused by the shader (center/radius come from
+    // aCenterRadius) — left at its default identity-per-instance contents and
+    // never uploaded to.
 
     this._instances = new Map();  // entity -> instanceId
     this._free = [];              // recycled instance ids
     this._highWater = 0;          // max id ever used + 1 (== mesh.count target)
-    this._mat4 = new THREE.Matrix4();
-    // Dirty-range tracking for the instanceMatrix buffer (same fix class as
+    // Dirty-range tracking for the aCenterRadius buffer (same fix class as
     // InstancedSlot.flushInstanceTexture/_flushBoundAttr in model-pool.js): a
     // single movable impostor's setCenter() otherwise re-uploads the WHOLE
-    // maxInstances*16-float buffer every frame via needsUpdate. Track merged
+    // maxInstances*4-float buffer every frame via needsUpdate. Track merged
     // disjoint per-instance component runs and flush via addUpdateRange once
     // per frame instead.
     this._instMatDirtyRuns = [];
@@ -306,18 +315,18 @@ export class OctahedralImpostorTier {
   }
 
   _writeInstance(id, x, y, z, r) {
-    this._mat4.makeScale(r, r, r);
-    this._mat4.setPosition(x, y, z);
-    this.mesh.setMatrixAt(id, this._mat4);
+    const arr = this._centerRadiusAttr.array;
+    const base = id * 4;
+    arr[base] = x; arr[base + 1] = y; arr[base + 2] = z; arr[base + 3] = r;
     this._markInstMatDirty(id);
   }
 
-  // Insert instance id's 16-float component range into a merged disjoint-run
+  // Insert instance id's 4-float component range into a merged disjoint-run
   // list (identical shape to InstancedSlot._markInstanceTexDirty in
   // model-pool.js) so N scattered per-frame movers upload O(N) instances
   // instead of O(maxInstances) instances.
   _markInstMatDirty(id) {
-    const lo = id * 16, hi = lo + 15;
+    const lo = id * 4, hi = lo + 3;
     const runs = this._instMatDirtyRuns;
     let i = 0;
     while (i < runs.length && runs[i][1] < lo - 1) i++;
@@ -337,7 +346,7 @@ export class OctahedralImpostorTier {
   flush() {
     const runs = this._instMatDirtyRuns;
     if (runs.length > 0) {
-      const attr = this.mesh.instanceMatrix;
+      const attr = this._centerRadiusAttr;
       if (typeof attr.addUpdateRange === 'function') {
         attr.clearUpdateRanges();
         for (const [lo, hi] of runs) attr.addUpdateRange(lo, hi - lo + 1);
@@ -351,11 +360,9 @@ export class OctahedralImpostorTier {
     const id = this._instances.get(entity);
     if (id == null) return;
     this._instances.delete(entity);
-    // Park the instance at a degenerate scale so it rasterizes nothing until the
-    // id is recycled (InstancedMesh has no per-instance hide flag).
-    this._mat4.makeScale(0, 0, 0);
-    this.mesh.setMatrixAt(id, this._mat4);
-    this._markInstMatDirty(id);
+    // Park the instance at a degenerate (zero) radius so it rasterizes nothing
+    // until the id is recycled (InstancedMesh has no per-instance hide flag).
+    this._writeInstance(id, 0, 0, 0, 0);
     this._free.push(id);
     // Compact: if the highest-index instance was freed, shrink the high-water
     // mark (and mesh.count) past any now-trailing free ids so the renderer stops
