@@ -3,7 +3,15 @@
 // Wraps a single unified geometry (one mesh / one primitive, the full-res LOD0 in
 // geometry.index + the coarse LOD1..N indices appended) plus the per-cluster
 // metadata parsed from extras.EP_cluster_lod. Each frame it:
-//   1. frustum-culls clusters by their bounding sphere (CPU),
+//   1. frustum-culls clusters by their bounding AABB (CPU) -- NOT the bounding
+//      sphere: a sphere fitted to thin flat geometry (floor/wall/panel slabs
+//      ~0.1-0.2m thick) is small and centered, under-covering the slab's actual
+//      in-plane extent, which false-culls near frustum edges (parts pop in/out
+//      as the camera moves). The AABB is exact-fit to the same LOD0 vertices and
+//      was already computed + stored per cluster (meshlet-codec.js's `c.aabb`),
+//      so this swaps the test, not the source data. The bounding sphere is still
+//      used for the LOD projected-size estimate below (cheap distance/radius
+//      proxy, not a cull test, so its under-coverage doesn't matter there).
 //   2. picks a LOD per visible cluster from projected screen size,
 //   3. accumulates the chosen index sub-ranges as geometry GROUPS, and
 //   4. lets three's normal render pipeline issue one drawElements call PER
@@ -24,6 +32,7 @@ import * as THREE from 'three';
 import { parseClusterLod } from './meshlet-codec.js';
 
 const _sphere = new THREE.Sphere();
+const _box = new THREE.Box3();
 const _frustum = new THREE.Frustum();
 const _projScreen = new THREE.Matrix4();
 const _v = new THREE.Vector3();
@@ -146,8 +155,19 @@ export class ClusterLodMesh extends THREE.Mesh {
       const c = clusters[ci];
       _sphere.center.set(c.sphere[0], c.sphere[1], c.sphere[2]).applyMatrix4(this.matrixWorld);
       _sphere.radius = c.sphere[3] * scale;
-      if (!this._spointNoClusterCull && !_frustum.intersectsSphere(_sphere)) continue;
+      // Cull test uses the per-cluster AABB (exact-fit to the cluster's LOD0 verts),
+      // not the bounding sphere: a sphere under-covers thin flat geometry (slabs),
+      // false-culling near frustum edges. box3.min/max in local space -> world AABB
+      // via applyMatrix4 (re-fits axis-aligned bounds correctly under rotation,
+      // unlike scaling a sphere radius).
+      const a = c.aabb;
+      _box.min.set(a[0], a[1], a[2]);
+      _box.max.set(a[3], a[4], a[5]);
+      _box.applyMatrix4(this.matrixWorld);
+      if (!this._spointNoClusterCull && !_frustum.intersectsBox(_box)) continue;
       visible++;
+      // Sphere center/radius still drive the projected-size LOD estimate (cheap
+      // distance/radius proxy, not a cull test -- under-coverage doesn't matter here).
       const dist = Math.max(1e-3, _sphere.center.distanceTo(camPos));
       const projSize = (sh * _sphere.radius) / (dist * tanHalf);
       const lodIdx = this._pickLod(ci, projSize);
