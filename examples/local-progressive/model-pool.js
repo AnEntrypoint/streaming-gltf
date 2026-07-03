@@ -1864,16 +1864,22 @@ class Entity extends Emitter {
     }
     // Compose the world billboard placement from the asset-local descriptor and
     // this entity's transform (bounding-safe scale factor = max(|sx|,|sy|,|sz|),
-    // tight and correct for both uniform and non-uniform scale).
-    const wc = _tmpV3b.copy(desc.center).applyMatrix4(this.root.matrixWorld);
-    const s = _maxAbsScale(this.root.scale);
-    const wr = desc.radius * s;
+    // tight and correct for both uniform and non-uniform scale). Only needed on
+    // first acquire (static placement, computed once) or every frame while
+    // movable — skip the applyMatrix4 + scale.length() sqrt entirely for a
+    // static impostor that's already active.
     if (!this._impostorActive) {
+      const wc = _tmpV3b.copy(desc.center).applyMatrix4(this.root.matrixWorld);
+      const s = _maxAbsScale(this.root.scale);
+      const wr = desc.radius * s;
       this._setTrackedDrawsHidden(true);
       this._impostorActive = true;
       this.pool._impostorActiveCount++;
       this._impostorId = tier.acquire(this, desc.layer, wc.x, wc.y, wc.z, wr);
     } else if (movable) {
+      const wc = _tmpV3b.copy(desc.center).applyMatrix4(this.root.matrixWorld);
+      const s = _maxAbsScale(this.root.scale);
+      const wr = desc.radius * s;
       tier.setCenter(this._impostorId, wc.x, wc.y, wc.z, wr);
     }
     return this._impostorId >= 0;
