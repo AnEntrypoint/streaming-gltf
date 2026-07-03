@@ -88,7 +88,28 @@ export class OcclusionQueryTier {
       }
       if (rec.pending) continue; // previous query still in flight, don't double-issue
 
-      _box.setFromObject(entity.root);
+      // Cache the LOCAL-space AABB once per entity (full subtree traversal +
+      // geometry-bounds union is expensive and this tier's candidates are
+      // static-geometry model-pool entities -- their mesh/geometry never
+      // changes after creation, only entity.root's transform moves). Computed
+      // ONCE by taking the current world-space box and un-transforming it by
+      // the inverse of the CURRENT matrixWorld (no mutation of entity.root,
+      // safe regardless of what else touches its transform this frame). Every
+      // subsequent frame just re-derives the world AABB from the cached local
+      // box + entity's CURRENT matrixWorld via Box3.applyMatrix4 (the standard
+      // re-derive-min/max-from-basis-vectors trick) instead of a full
+      // subtree retraversal.
+      if (!rec.localBox) {
+        entity.root.updateWorldMatrix(true, true);
+        const worldBox = new THREE.Box3().setFromObject(entity.root);
+        if (worldBox.isEmpty()) { rec.localBox = null; }
+        else {
+          const invMatrix = new THREE.Matrix4().copy(entity.root.matrixWorld).invert();
+          rec.localBox = worldBox.applyMatrix4(invMatrix);
+        }
+      }
+      if (!rec.localBox) continue;
+      _box.copy(rec.localBox).applyMatrix4(entity.root.matrixWorld);
       if (_box.isEmpty()) continue;
       _box.getSize(_size);
       _box.getCenter(_center);
