@@ -10,6 +10,13 @@ npm releases (`chore release vX.Y.Z` commits). Format is loosely
   `parseClusterLod()`, `attachClusterLod()`; idempotent `ModelPool.dispose()`;
   clearer errors for malformed GLB responses and misconfigured queues.
 - docs: JSDoc type annotations on the public `index.js` exports; this file.
+- feat: publish `OcclusionQueryTier` as a standalone export
+  (`streaming-gltf/occlusion-query-tier`). It was already renderer-agnostic
+  (any candidate exposing `.root`, a `THREE.Object3D`), previously only
+  reachable internally by `ModelPool` -- consumers can now drive the same
+  WebGL2 `ANY_SAMPLES_PASSED_CONSERVATIVE` box-query occlusion culling for
+  non-model scene layers (e.g. chunked vegetation/terrain) sharing the same
+  depth buffer.
 
 ## 2.0.14
 
