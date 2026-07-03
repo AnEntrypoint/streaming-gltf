@@ -79,6 +79,13 @@ export class ClusterLodMesh extends THREE.Mesh {
     this._worldAabbMax = new Float32Array(n * 3);
     this._worldAabbValid = false;
     this._lastMatrixEls = new Float32Array(16);
+    // World-space sphere cache (center xyz + radius) + the scale scalar used to derive world
+    // radius from the local sphere.sphere[3] -- computed under the SAME matrixChanged guard as
+    // the AABB cache above, so a static (non-moving) cluster's sphere is transformed once per
+    // matrix change instead of every frame it's drawn.
+    this._worldSphereCenter = new Float32Array(n * 3);
+    this._worldSphereRadius = new Float32Array(n);
+    this._scale = 1;
 
     this._ext = null;
     this._extProbed = false;
@@ -152,21 +159,29 @@ export class ClusterLodMesh extends THREE.Mesh {
     }
     const camPos = _camCache.camPos, sh = _camCache.sh, tanHalfSq = _camCache.tanHalfSq;
     const me = this.matrixWorld.elements;
-    const scale = Math.max(
-      Math.hypot(me[0], me[1], me[2]),
-      Math.hypot(me[4], me[5], me[6]),
-      Math.hypot(me[8], me[9], me[10])
-    );
 
     // Static-entity fast path: this instance's matrixWorld is identical to the frame that last
-    // computed _worldAabbMin/Max, so every cluster's world AABB below is already correct -- skip
-    // the per-cluster applyMatrix4 (8-corner transform) entirely for the (common) non-moving case.
+    // computed _worldAabbMin/Max (and now the world-sphere cache below), so every cluster's world
+    // AABB/sphere is already correct -- skip the per-cluster applyMatrix4 (8-corner transform) and
+    // sphere transform entirely for the (common) non-moving case.
     const last = this._lastMatrixEls;
     let matrixChanged = !this._worldAabbValid;
     if (!matrixChanged) {
       for (let i = 0; i < 16; i++) { if (last[i] !== me[i]) { matrixChanged = true; break; } }
     }
-    if (matrixChanged) { last.set(me); this._worldAabbValid = true; }
+    // Scale scalar (magnitude of the largest basis column) is only needed to derive world sphere
+    // radius from local radius, and that derivation only happens under matrixChanged below -- so
+    // only recompute it when the matrix actually changed; otherwise reuse the cached value.
+    // Math.sqrt(max of squared lengths) is one sqrt total instead of three Math.hypot calls (each
+    // of which is itself a sqrt internally), since we only need the MAX column length, not all three.
+    if (matrixChanged) {
+      const sq0 = me[0] * me[0] + me[1] * me[1] + me[2] * me[2];
+      const sq1 = me[4] * me[4] + me[5] * me[5] + me[6] * me[6];
+      const sq2 = me[8] * me[8] + me[9] * me[9] + me[10] * me[10];
+      this._scale = Math.sqrt(Math.max(sq0, sq1, sq2));
+      last.set(me); this._worldAabbValid = true;
+    }
+    const scale = this._scale;
 
     // GEOMETRY GROUPS (not a custom multiDraw). onBeforeRender runs BEFORE three binds this mesh's
     // VAO, so a custom gl draw here ran with the wrong/stale element+vertex state -> GL_INVALID
@@ -182,29 +197,49 @@ export class ClusterLodMesh extends THREE.Mesh {
     const clusters = this.clusterSet.clusters;
     for (let ci = 0; ci < clusters.length; ci++) {
       const c = clusters[ci];
-      _sphere.center.set(c.sphere[0], c.sphere[1], c.sphere[2]).applyMatrix4(this.matrixWorld);
-      _sphere.radius = c.sphere[3] * scale;
       // Cull test uses the per-cluster AABB (exact-fit to the cluster's LOD0 verts),
       // not the bounding sphere: a sphere under-covers thin flat geometry (slabs),
       // false-culling near frustum edges. box3.min/max in local space -> world AABB
       // via applyMatrix4 (re-fits axis-aligned bounds correctly under rotation,
-      // unlike scaling a sphere radius).
+      // unlike scaling a sphere radius). Run BEFORE any sphere work below so a
+      // culled cluster never pays for a world-sphere transform it won't use.
       const o3 = ci * 3;
       if (matrixChanged) {
+        // Both the AABB and the world sphere are cached unconditionally here (NOT gated on the
+        // cull test below), because the cull test's OUTCOME can change frame-to-frame even when
+        // matrixChanged stays false (the camera moves, changing the frustum, while this object's
+        // own matrixWorld does not) -- if a cluster's sphere were only cached when it happened to
+        // also pass the cull test on the matrixChanged frame, a later frame where it becomes
+        // visible under the SAME (unchanged) matrix would read a stale/never-written cache entry.
+        // Caching both under matrixChanged alone, independent of visibility, keeps the invariant
+        // "cache is valid whenever matrixChanged is false" true for every cluster, not just the
+        // ones visible on the frame the matrix last changed.
         const a = c.aabb;
         _box.min.set(a[0], a[1], a[2]);
         _box.max.set(a[3], a[4], a[5]);
         _box.applyMatrix4(this.matrixWorld);
         this._worldAabbMin[o3] = _box.min.x; this._worldAabbMin[o3 + 1] = _box.min.y; this._worldAabbMin[o3 + 2] = _box.min.z;
         this._worldAabbMax[o3] = _box.max.x; this._worldAabbMax[o3 + 1] = _box.max.y; this._worldAabbMax[o3 + 2] = _box.max.z;
+
+        _sphere.center.set(c.sphere[0], c.sphere[1], c.sphere[2]).applyMatrix4(this.matrixWorld);
+        _sphere.radius = c.sphere[3] * scale;
+        this._worldSphereCenter[o3] = _sphere.center.x; this._worldSphereCenter[o3 + 1] = _sphere.center.y; this._worldSphereCenter[o3 + 2] = _sphere.center.z;
+        this._worldSphereRadius[ci] = _sphere.radius;
       } else {
         _box.min.set(this._worldAabbMin[o3], this._worldAabbMin[o3 + 1], this._worldAabbMin[o3 + 2]);
         _box.max.set(this._worldAabbMax[o3], this._worldAabbMax[o3 + 1], this._worldAabbMax[o3 + 2]);
       }
       if (!this._spointNoClusterCull && !_frustum.intersectsBox(_box)) continue;
       visible++;
-      // Sphere center/radius still drive the projected-size LOD estimate (cheap
-      // distance/radius proxy, not a cull test -- under-coverage doesn't matter here).
+      // Sphere center/radius still drive the projected-size LOD estimate (cheap distance/radius
+      // proxy, not a cull test -- under-coverage doesn't matter here). Read from the cache here
+      // (populated above, either freshly this frame or on a prior matrixChanged frame); the
+      // per-cluster transform itself is skipped for AABB-culled clusters since we only reach here
+      // after the cull test has already passed.
+      if (!matrixChanged) {
+        _sphere.center.set(this._worldSphereCenter[o3], this._worldSphereCenter[o3 + 1], this._worldSphereCenter[o3 + 2]);
+        _sphere.radius = this._worldSphereRadius[ci];
+      }
       // Squared form: distSq via distanceToSquared (no sqrt), sizeSq = (sh*radius)^2
       // compared against eff^2*tanHalf^2*distSq -- see _pickLod's algebra comment.
       // The original 1e-3 floor guarded `dist` before division-by-dist; squared form
