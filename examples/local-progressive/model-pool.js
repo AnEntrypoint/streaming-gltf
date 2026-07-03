@@ -305,7 +305,18 @@ class InstancedSlot {
       if (runs[j][1] > mergedHi) mergedHi = runs[j][1];
       j++;
     }
-    runs.splice(i, j - i, [mergedLo, mergedHi]);
+    // PERF: the common case (a moving instance touching/extending an already-
+    // dirty run) has j > i, i.e. at least one existing [lo,hi] tuple is being
+    // replaced — reuse that tuple's array in place instead of splice()'ing in
+    // a freshly allocated 2-element array every call. Only allocate when this
+    // is a genuinely new, disjoint run (j === i, nothing to reuse).
+    if (j > i) {
+      const tuple = runs[i];
+      tuple[0] = mergedLo; tuple[1] = mergedHi;
+      if (j - i > 1) runs.splice(i + 1, j - i - 1);
+    } else {
+      runs.splice(i, 0, [mergedLo, mergedHi]);
+    }
   }
   // Upload only the touched component runs via addUpdateRange instead of a
   // full-buffer needsUpdate re-upload every frame any instance's bound sphere
@@ -379,7 +390,16 @@ class InstancedSlot {
       if (runs[j][1] > mergedHi) mergedHi = runs[j][1];
       j++;
     }
-    runs.splice(i, j - i, [mergedLo, mergedHi]);
+    // PERF: same in-place-reuse fix as _markBoundDirty above — avoid
+    // allocating a fresh 2-element tuple on every instance write when an
+    // existing run can be mutated in place instead.
+    if (j > i) {
+      const tuple = runs[i];
+      tuple[0] = mergedLo; tuple[1] = mergedHi;
+      if (j - i > 1) runs.splice(i + 1, j - i - 1);
+    } else {
+      runs.splice(i, 0, [mergedLo, mergedHi]);
+    }
   }
   // Upload only the touched texel columns via THREE's addUpdateRange (three>=0.159) instead of a
   // full-width needsUpdate re-upload every frame something moved. PERF (2026-07-02, spoint consumer
@@ -3205,7 +3225,11 @@ export class ModelPool extends Emitter {
     // PHASE 2 OPTIMIZATION: Update cached frustum planes once per frame
     // This eliminates per-vertex plane extraction (16 instructions per vertex).
     if (this._frustumCache) {
-      this._frustumCache.updatePlanes(this.camera);
+      // Pass the projView-derived frustum already built above — updatePlanes
+      // would otherwise redo the identical projection*matrixWorldInverse
+      // multiply + THREE.Frustum.setFromProjectionMatrix extraction a second
+      // time per frame for the same camera/matrix.
+      this._frustumCache.updatePlanes(this.camera, this._frustum);
     }
     // Publish projView to every InstancedSlot's shader uniform so the GPU
     // can run the per-instance frustum cull pass.
@@ -3217,10 +3241,21 @@ export class ModelPool extends Emitter {
     // frame with a small epsilon to avoid thrash when the camera is still.
     {
       const cp = this.camera.position;
-      const lp = this._lastCamPos || (this._lastCamPos = { x: Infinity, y: 0, z: 0, fov: 0 });
-      const moved = Math.abs(cp.x - lp.x) > 1e-3 || Math.abs(cp.y - lp.y) > 1e-3 || Math.abs(cp.z - lp.z) > 1e-3 || this.camera.fov !== lp.fov;
+      const lp = this._lastCamPos || (this._lastCamPos = { x: Infinity, y: 0, z: 0, fov: 0, qx: 0, qy: 0, qz: 0, qw: 1 });
+      const cq = this.camera.quaternion;
+      // Quaternion dot-product delta: catches a PURE in-place rotation (no
+      // position/fov change) that would otherwise never bump _cameraMoved —
+      // there is no periodic/time-based fallback recheck elsewhere in this
+      // file, so a static instanced entity's cached screenPx/LOD would
+      // otherwise never re-evaluate while only the view direction changes.
+      // 1 - |dot| ~= (theta/2)^2 for small angles; ~0.0005 corresponds to a
+      // rotation of roughly half a degree, well below visible LOD-pop thresholds
+      // but far above quaternion normalization jitter.
+      const qDot = cq.x * lp.qx + cq.y * lp.qy + cq.z * lp.qz + cq.w * lp.qw;
+      const rotated = (1 - Math.abs(qDot)) > 0.0005;
+      const moved = Math.abs(cp.x - lp.x) > 1e-3 || Math.abs(cp.y - lp.y) > 1e-3 || Math.abs(cp.z - lp.z) > 1e-3 || this.camera.fov !== lp.fov || rotated;
       this._cameraMoved = moved;
-      if (moved) { lp.x = cp.x; lp.y = cp.y; lp.z = cp.z; lp.fov = this.camera.fov; }
+      if (moved) { lp.x = cp.x; lp.y = cp.y; lp.z = cp.z; lp.fov = this.camera.fov; lp.qx = cq.x; lp.qy = cq.y; lp.qz = cq.z; lp.qw = cq.w; }
       // Bump the LOD-evaluation epoch when the camera moved OR the global LOD
       // distance-scale shifted beyond a quantum since last frame. Entities only
       // re-pick their LOD when the epoch changes (see Entity._update), so a
@@ -3233,10 +3268,27 @@ export class ModelPool extends Emitter {
       if (moved || scaleChanged) { this._lodEpoch++; this._lastLodScale = scaleNow; }
     }
     const vh = this.renderer.domElement.clientHeight;
+    // PERF: every InstancedSlot's projViewMatrix uniform receives the SAME
+    // projView matrix this frame (one camera, one pool-wide `update()` per
+    // frame) — there is no per-slot variation. Previously each slot did a
+    // full mat4 .copy() of `this._tmpMatrix` into its own Matrix4 (N copies
+    // for N slots); now every slot's uniform.value is repointed to the SAME
+    // shared matrix reference, collapsing N copies to N cheap reference
+    // assignments. Safe because three.js reads uniform.value synchronously
+    // during this frame's render (after this loop, before `_tmpMatrix` is
+    // ever mutated again next frame's update()), and a `{value}` uniform
+    // wrapper object's IDENTITY must stay stable across frames (captured by
+    // reference at shader compile time via `shader.uniforms.projViewMatrix =
+    // uniforms.projViewMatrix`) but `.value` itself may be reassigned freely.
+    // Note (documented, not fixed here): `_instancedSlots` can map multiple
+    // keys to the SAME underlying slot object (QW4 reuse pattern), so this
+    // loop may touch one physical slot more than once per frame — each extra
+    // touch is now a no-op-cost reference reassignment rather than a mat4
+    // copy, so it is left as a minor, low-value dedup opportunity.
     for (const slot of this._instancedSlots.values()) {
       // BatchedFarTier adapters have no projViewMatrix uniform — BatchedMesh
       // does its own transform + per-instance cull internally.
-      if (slot._uniforms) slot._uniforms.projViewMatrix.value.copy(this._tmpMatrix);
+      if (slot._uniforms) slot._uniforms.projViewMatrix.value = this._tmpMatrix;
     }
     const tFrustum1 = performance.now();
 
