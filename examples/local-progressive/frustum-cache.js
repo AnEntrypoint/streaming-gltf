@@ -35,21 +35,29 @@ export class CachedFrustumPlanes {
    * Call once per frame before rendering.
    *
    * @param {THREE.Camera} camera - The camera to extract planes from.
+   * @param {THREE.Frustum} [sourceFrustum] - Optional already-computed frustum
+   *   (e.g. the caller's own per-frame `THREE.Frustum.setFromProjectionMatrix`
+   *   result) to copy planes from directly, skipping the redundant
+   *   projView multiply + plane extraction this method would otherwise redo
+   *   from `camera` itself. Pass this whenever the caller already built a
+   *   frustum from the same camera/projView this frame.
    */
-  updatePlanes(camera) {
-    // Compose view-projection matrix: projection × inverse(matrixWorld)
-    this._tmpMatrix.multiplyMatrices(
-      camera.projectionMatrix,
-      camera.matrixWorldInverse
-    );
-
-    // Use Three.js Frustum to extract the 6 planes
-    this._frustum.setFromProjectionMatrix(this._tmpMatrix);
+  updatePlanes(camera, sourceFrustum) {
+    const frustum = sourceFrustum || (() => {
+      // Compose view-projection matrix: projection × inverse(matrixWorld)
+      this._tmpMatrix.multiplyMatrices(
+        camera.projectionMatrix,
+        camera.matrixWorldInverse
+      );
+      // Use Three.js Frustum to extract the 6 planes
+      this._frustum.setFromProjectionMatrix(this._tmpMatrix);
+      return this._frustum;
+    })();
 
     // Copy planes from frustum to our uniform array
     // Frustum.planes is a Vector4[] where each plane is (normal.x, normal.y, normal.z, distance)
     for (let i = 0; i < 6; i++) {
-      const srcPlane = this._frustum.planes[i];
+      const srcPlane = frustum.planes[i];
       const dstPlane = this.planes[i];
       dstPlane.x = srcPlane.normal.x;
       dstPlane.y = srcPlane.normal.y;
