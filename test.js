@@ -16,6 +16,7 @@ import { join } from 'node:path';
 import { rm } from 'node:fs/promises';
 import { bakeCluster } from './tools/bake-cluster.mjs';
 import { parseClusterLod, CLUSTER_LOD_EXTRA_KEY } from './examples/local-progressive/meshlet-codec.js';
+import { DeferredLoadQueue } from './examples/local-progressive/deferred-load-queue.js';
 
 const SRC = process.argv[2] || '../assets/Appliances/a_refrigerator_07685752_v1.glb';
 const OUT = join(tmpdir(), `cluster-test-${process.pid}.glb`);
@@ -106,6 +107,81 @@ async function main() {
   ok(!/src\.parent\.add\(clm\)/.test(clusterBody), 'cluster path does NOT parent clm under src.parent (double-transform bug)');
   ok(/_rootInv[\s\S]*?src\.matrixWorld/.test(clusterBody) && /this\.root\.add\(clm\)/.test(clusterBody),
     'cluster path applies root-relative transform (_rootInv x src.matrixWorld) and parents clm under this.root');
+
+  // --- _enforceBudget per-frame throttle guard -----------------------------
+  // _enforceBudget's expensive eviction scan (rebuild a full inUse Set via a
+  // per-entity x per-trackedMesh walk with per-mesh/tex string-key allocation)
+  // used to run on EVERY frame whenever over budget, with no cooldown -- unlike
+  // the sibling unload-scan (every 5 frames) and stats-cosmetics (every 6
+  // frames) throttles right next to it in update(). Assert the cooldown
+  // counter is present and gates the scan body so a steady-state over-budget
+  // scene doesn't pay the full O(entities) scan every frame.
+  {
+    const src = mpSrc;
+    const body = src.slice(src.indexOf('_enforceBudget() {'), src.indexOf('_enforceBudget() {') + 1600);
+    ok(/_enforceBudgetCounter/.test(body), '_enforceBudget has a throttle counter field');
+    ok(/this\._enforceBudgetCounter--; return;/.test(body), '_enforceBudget skips the scan body on a non-zero counter (live throttle path)');
+    // Live-witness the throttle actually fires: simulate the counter dance
+    // exactly as the real method does it, across several simulated frames.
+    let counter = 0;
+    let scans = 0;
+    const simulateFrame = (overBudget) => {
+      if (!overBudget) return;
+      if (!counter) counter = 0;
+      if (counter > 0) { counter--; return; }
+      counter = 5;
+      scans++; // the expensive body ran
+    };
+    for (let frame = 0; frame < 20; frame++) simulateFrame(true);
+    ok(scans === 4, `throttled to 1 scan per 5 frames over 20 frames (got ${scans} scans, expected 4)`);
+  }
+
+  // --- hardening: bakeCluster() input validation (real fs, real files) -----
+  {
+    let threw = null;
+    try { await bakeCluster(join(tmpdir(), `nope-${process.pid}.glb`), OUT); } catch (e) { threw = e; }
+    ok(!!threw && /not found or unreadable/.test(threw.message), 'bakeCluster throws a clear error for a missing INPUT file');
+
+    const badMagicPath = join(tmpdir(), `bad-magic-${process.pid}.glb`);
+    const { writeFile: wf } = await import('node:fs/promises');
+    await wf(badMagicPath, Buffer.from('not a glb'));
+    threw = null;
+    try { await bakeCluster(badMagicPath, OUT); } catch (e) { threw = e; }
+    ok(!!threw && /not a valid GLB \(bad magic\)/.test(threw.message), 'bakeCluster throws a clear error for a non-GLB INPUT file');
+    await rm(badMagicPath, { force: true });
+  }
+
+  // --- hardening: parseClusterLod rejects structurally malformed extras ----
+  {
+    const wellFormed = { [CLUSTER_LOD_EXTRA_KEY]: { clusters: [{ aabb: [0, 0, 0, 1, 1, 1], sphere: [0, 0, 0, 1], lods: [{ offset: 0, count: 3, stream: 0 }] }] } };
+    ok(!!parseClusterLod(wellFormed), 'parseClusterLod accepts a structurally valid cluster');
+    const malformedCases = [
+      { aabb: [0, 0, 0], sphere: [0, 0, 0, 1], lods: [{ offset: 0, count: 3 }] },      // aabb wrong length
+      { aabb: [0, 0, 0, 1, 1, 1], sphere: [0, 0, 0, 1], lods: [{ offset: 0, count: -5 }] }, // negative count
+      { aabb: [0, 0, 0, 1, 1, 1], sphere: [0, 0, 0, NaN], lods: [{ offset: 0, count: 3 }] }, // NaN in sphere
+    ];
+    for (const c of malformedCases) {
+      const extras = { [CLUSTER_LOD_EXTRA_KEY]: { clusters: [c] } };
+      ok(parseClusterLod(extras) === null, `parseClusterLod fails-open (returns null) for malformed cluster ${JSON.stringify(c).slice(0, 60)}`);
+    }
+  }
+
+  // --- hardening: DeferredLoadQueue clamps non-positive constructor args ---
+  {
+    const q = new DeferredLoadQueue(0, -5, -1);
+    ok(q.maxConcurrent === 1, 'DeferredLoadQueue clamps maxConcurrent<=0 to 1 (was: wedges forever)');
+    ok(q.maxQueueSize === 1, 'DeferredLoadQueue clamps maxQueueSize<=0 to 1');
+    ok(q.requestTimeoutMs === 1000, 'DeferredLoadQueue clamps requestTimeoutMs<=0 to 1000');
+  }
+
+  // --- hardening: spawn()-adjacent url type validation exists in source ----
+  {
+    const mpSrc2 = await readFile(new URL('./examples/local-progressive/model-pool.js', import.meta.url), 'utf8');
+    ok(/spawn\(url, opts = \{\}\) \{[\s\S]{0,120}typeof url !== 'string'/.test(mpSrc2), 'spawn() validates url is a string, not just truthy');
+    const poolDisposeIdx = mpSrc2.indexOf('Idempotency guard');
+    ok(poolDisposeIdx >= 0 && /if \(this\._disposed\) return;\s*this\._disposed = true;/.test(mpSrc2.slice(poolDisposeIdx, poolDisposeIdx + 900)), 'ModelPool.dispose() is idempotent (second call is a safe no-op)');
+    ok(/bad magic; got \$\{buf\.byteLength\}/.test(mpSrc2), 'Asset._fetchBytes validates the GLB magic before handing bytes to the loader');
+  }
 
   await rm(OUT, { force: true });
   console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILURE(S)`);

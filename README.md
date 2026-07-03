@@ -261,6 +261,10 @@ single-draw performant path. The impostor sampling/baking code is localized from
 [@three.ez/octahedron-imposter](https://github.com/agargaro/octahedral-impostor)
 (`octahedral-impostor-ez.js`).
 
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for release notes per version.
+
 ## Notes
 
 - The renderer is draw-call-bound at scale; the FAR tier collapses many distinct

@@ -22,7 +22,7 @@ import { dedup, simplify, cloneDocument } from '@gltf-transform/functions';
 import { MeshoptEncoder, MeshoptDecoder, MeshoptSimplifier } from 'meshoptimizer';
 import draco3dgltf from 'draco3dgltf';
 import { buildClusterLod, buildClusterLodExtra, CLUSTER_LOD_EXTRA_KEY } from '../examples/local-progressive/meshlet-codec.js';
-import { writeFile, mkdir } from 'node:fs/promises';
+import { writeFile, mkdir, readFile, stat } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
 // Discrete-LOD ratios for SKINNED/morph primitives (cluster-LOD cannot handle them
@@ -120,7 +120,30 @@ async function _bakeSkinnedLods(srcDoc, io, meshIndex, primIndex, lodsDir, baseN
   return { meshIndex, primIndex, lods };
 }
 
+// Pre-flight validation of INPUT: a missing file or a file that isn't actually
+// a GLB previously fell straight into io.read(INPUT), which throws an opaque
+// gltf-transform-internal error with no hint the real problem was "wrong path"
+// or "not a GLB" -- surfaces a clear, actionable message instead. The CLI entry
+// point already wraps bakeCluster() in a .catch, but that only helps when
+// invoked from the command line; a programmatic caller (e.g. bake-cluster-corpus.mjs,
+// or a consumer importing { bakeCluster } directly) gets the same opaque error
+// without this check.
+async function _validateInputGlb(INPUT) {
+  let st;
+  try {
+    st = await stat(INPUT);
+  } catch (e) {
+    throw new Error(`bakeCluster: INPUT not found or unreadable: ${INPUT} (${e.code || e.message})`);
+  }
+  if (!st.isFile()) throw new Error(`bakeCluster: INPUT is not a file: ${INPUT}`);
+  const fh = await readFile(INPUT);
+  if (fh.byteLength < 4 || fh.readUInt32LE(0) !== 0x46546c67) {
+    throw new Error(`bakeCluster: INPUT is not a valid GLB (bad magic): ${INPUT}`);
+  }
+}
+
 async function bakeCluster(INPUT, OUTPUT) {
+  await _validateInputGlb(INPUT);
   await MeshoptEncoder.ready;
   await MeshoptDecoder.ready;
   await MeshoptSimplifier.ready;
@@ -135,6 +158,13 @@ async function bakeCluster(INPUT, OUTPUT) {
   const doc = await io.read(INPUT);
   const root = doc.getRoot();
   const buffer = root.listBuffers()[0];
+  // A degenerate/malformed glTF with zero buffers would otherwise let every
+  // later `.setBuffer(buffer)` silently attach an accessor to `undefined`,
+  // producing a corrupt output GLB instead of a clear upfront failure. Only
+  // an actual clustering candidate needs a buffer to write into, so this check
+  // fires lazily -- right before the first prim that would need one -- rather
+  // than unconditionally (a document with only skinned/skipped prims and no
+  // static geometry to cluster never needs to write a new accessor at all).
 
   let clustered = 0, skipped = 0, totalClusters = 0, skinnedLodded = 0;
   const pendingExtras = []; // { prim, result, coarseAcc } resolved after transforms
@@ -163,6 +193,7 @@ async function bakeCluster(INPUT, OUTPUT) {
 
       const result = await buildClusterLod(geo, { maxVertices: 64, maxTriangles: 128, lodRatios: [1, 0.5, 0.25] });
       if (!result.clusters.length) { skipped++; continue; }
+      if (!buffer) throw new Error(`bakeCluster: document has a clusterable static primitive (mesh ${mi} prim ${pi}) but no buffer to write the reordered accessors into (root.listBuffers() is empty) -- malformed glTF`);
 
       // Rewrite attributes with the reordered unified arrays.
       for (const outAttr of result.attributes) {

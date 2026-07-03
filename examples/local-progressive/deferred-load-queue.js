@@ -14,6 +14,22 @@
 
 export class DeferredLoadQueue {
   constructor(maxConcurrent = 2, maxQueueSize = 50, requestTimeoutMs = 5000) {
+    // A non-positive maxConcurrent would permanently satisfy _processNext's
+    // `this._inFlight >= this.maxConcurrent` gate (0>=0 is true), silently
+    // wedging the queue forever with no error -- nothing would ever load and
+    // there'd be no hint why. Clamp to a sane minimum instead of failing open.
+    if (!(maxConcurrent > 0)) {
+      console.warn(`[deferred-queue] maxConcurrent must be >0 (got ${maxConcurrent}); clamped to 1`);
+      maxConcurrent = 1;
+    }
+    if (!(maxQueueSize > 0)) {
+      console.warn(`[deferred-queue] maxQueueSize must be >0 (got ${maxQueueSize}); clamped to 1`);
+      maxQueueSize = 1;
+    }
+    if (!(requestTimeoutMs > 0)) {
+      console.warn(`[deferred-queue] requestTimeoutMs must be >0 (got ${requestTimeoutMs}); clamped to 1000`);
+      requestTimeoutMs = 1000;
+    }
     this.maxConcurrent = maxConcurrent;
     this.maxQueueSize = maxQueueSize;
     this.requestTimeoutMs = requestTimeoutMs;

@@ -70,6 +70,16 @@ export class ClusterLodMesh extends THREE.Mesh {
     this._counts = new Int32Array(n);
     this._drawCount = 0;
 
+    // Per-cluster world-AABB cache: applyMatrix4 on the 8-corner box is redone only when this
+    // instance's OWN matrixWorld has actually changed since the last _render call (the vast
+    // majority of clustered entities -- static architecture/props -- never move after placement).
+    // _worldAabbMin/Max are flat Float32Arrays [x,y,z per cluster]; _lastMatrixEls is a copy of the
+    // 16 matrixWorld elements from the frame that produced them, compared cheaply before reuse.
+    this._worldAabbMin = new Float32Array(n * 3);
+    this._worldAabbMax = new Float32Array(n * 3);
+    this._worldAabbValid = false;
+    this._lastMatrixEls = new Float32Array(16);
+
     this._ext = null;
     this._extProbed = false;
     // Pooled geometry.groups objects -- mutated in place each frame instead of clearGroups()+
@@ -139,6 +149,16 @@ export class ClusterLodMesh extends THREE.Mesh {
       Math.hypot(me[8], me[9], me[10])
     );
 
+    // Static-entity fast path: this instance's matrixWorld is identical to the frame that last
+    // computed _worldAabbMin/Max, so every cluster's world AABB below is already correct -- skip
+    // the per-cluster applyMatrix4 (8-corner transform) entirely for the (common) non-moving case.
+    const last = this._lastMatrixEls;
+    let matrixChanged = !this._worldAabbValid;
+    if (!matrixChanged) {
+      for (let i = 0; i < 16; i++) { if (last[i] !== me[i]) { matrixChanged = true; break; } }
+    }
+    if (matrixChanged) { last.set(me); this._worldAabbValid = true; }
+
     // GEOMETRY GROUPS (not a custom multiDraw). onBeforeRender runs BEFORE three binds this mesh's
     // VAO, so a custom gl draw here ran with the wrong/stale element+vertex state -> GL_INVALID
     // 'Insufficient buffer size' storms on strict drivers (ANGLE/D3D11: context degrades, FPS
@@ -160,10 +180,18 @@ export class ClusterLodMesh extends THREE.Mesh {
       // false-culling near frustum edges. box3.min/max in local space -> world AABB
       // via applyMatrix4 (re-fits axis-aligned bounds correctly under rotation,
       // unlike scaling a sphere radius).
-      const a = c.aabb;
-      _box.min.set(a[0], a[1], a[2]);
-      _box.max.set(a[3], a[4], a[5]);
-      _box.applyMatrix4(this.matrixWorld);
+      const o3 = ci * 3;
+      if (matrixChanged) {
+        const a = c.aabb;
+        _box.min.set(a[0], a[1], a[2]);
+        _box.max.set(a[3], a[4], a[5]);
+        _box.applyMatrix4(this.matrixWorld);
+        this._worldAabbMin[o3] = _box.min.x; this._worldAabbMin[o3 + 1] = _box.min.y; this._worldAabbMin[o3 + 2] = _box.min.z;
+        this._worldAabbMax[o3] = _box.max.x; this._worldAabbMax[o3 + 1] = _box.max.y; this._worldAabbMax[o3 + 2] = _box.max.z;
+      } else {
+        _box.min.set(this._worldAabbMin[o3], this._worldAabbMin[o3 + 1], this._worldAabbMin[o3 + 2]);
+        _box.max.set(this._worldAabbMax[o3], this._worldAabbMax[o3 + 1], this._worldAabbMax[o3 + 2]);
+      }
       if (!this._spointNoClusterCull && !_frustum.intersectsBox(_box)) continue;
       visible++;
       // Sphere center/radius still drive the projected-size LOD estimate (cheap
@@ -215,9 +243,16 @@ export function attachClusterLod(geometry, extras, coarseIndexArray) {
   const lod0Count = lod0.length;
   const coarse = coarseIndexArray || new Uint32Array(0);
 
-  // One element buffer big enough for both; promote to Uint32 if needed.
+  // One element buffer big enough for both; promote to Uint32 if needed. The
+  // vertex-count check alone isn't sufficient: a malformed/hand-edited coarse
+  // accessor could itself contain an out-of-range index value even when the
+  // real vertex count fits in 16 bits, and a Uint16Array constructor would
+  // silently truncate/wrap that value rather than throwing -- so also check
+  // the actual max value present in the coarse array.
   const maxVid = geometry.attributes.position.count - 1;
-  const Ctor = maxVid > 65535 ? Uint32Array : Uint16Array;
+  let coarseMax = 0;
+  for (let i = 0; i < coarse.length; i++) if (coarse[i] > coarseMax) coarseMax = coarse[i];
+  const Ctor = (maxVid > 65535 || coarseMax > 65535) ? Uint32Array : Uint16Array;
   const combined = new Ctor(lod0Count + coarse.length);
   combined.set(lod0, 0);
   combined.set(coarse, lod0Count);

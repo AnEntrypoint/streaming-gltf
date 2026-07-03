@@ -318,6 +318,10 @@ self.addEventListener('message', async (ev) => {
     payload.bytes = buf.byteLength;
     self.postMessage({ id, ok: true, payload }, payloadTransferables(payload));
   } catch (e) {
-    self.postMessage({ id, ok: false, error: String(e && e.message || e) });
+    // Include the failing URL: without it, a DeferredLoadQueue caller logging
+    // this error has no way to tell WHICH sibling LOD/asset failed to fetch or
+    // parse (the timeout path already logs the key; a genuine fetch/parse
+    // failure previously surfaced only the bare error message).
+    self.postMessage({ id, ok: false, error: `${String(e && e.message || e)} (url: ${url})` });
   }
 });

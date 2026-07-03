@@ -19,9 +19,13 @@
     "examples/local-progressive/*.js",
     "tools/*.mjs",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "sideEffects": false,
+  "engines": {
+    "node": ">=18"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/AnEntrypoint/streaming-gltf.git"

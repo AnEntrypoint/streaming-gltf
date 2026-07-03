@@ -567,6 +567,14 @@ class Asset {
     const res = await fetch(url);
     if (!res.ok) throw new Error(`fetch ${url}: ${res.status}`);
     const buf = new Uint8Array(await res.arrayBuffer());
+    // A 200 response isn't necessarily a valid GLB (HTML error page served with
+    // 200, truncated download, wrong content-type from a misconfigured host) --
+    // catch that here with a clear message naming the URL, instead of letting
+    // GLTFLoader.parse() throw a low-level/cryptic binary-parsing error later
+    // that gives no hint the real problem was the server response, not the model.
+    if (buf.byteLength < 4 || (buf[0] !== 0x67 || buf[1] !== 0x6c || buf[2] !== 0x54 || buf[3] !== 0x46)) {
+      throw new Error(`fetch ${url}: response is not a valid GLB (bad magic; got ${buf.byteLength} byte(s), possibly an HTML error page or truncated download)`);
+    }
     this.pool._trackBytes(this.url, url, buf.byteLength);
     return buf;
   }
@@ -3022,6 +3030,7 @@ export class ModelPool extends Emitter {
   // Entity emits 'ready' once loading completes.
   spawn(url, opts = {}) {
     if (!url) throw new Error('spawn(): url required');
+    if (typeof url !== 'string') throw new TypeError(`spawn(): url must be a string, got ${typeof url}`);
     const assetPromise = this._resolveAsset(url);
     // Build a placeholder entity tied to a yet-to-resolve asset.
     // We attach to the entity once the asset is ready inside Entity._bootstrap.
@@ -3528,6 +3537,22 @@ export class ModelPool extends Emitter {
   }
   _enforceBudget() {
     if (this._totalBytes <= this.byteBudget) return;
+    // Throttle the expensive scan body (not the byteBudget gate above): once
+    // over budget in a steady state (common — the budget line is a moving
+    // target the FPS/VRAM controllers hover near), this function used to
+    // rebuild a full `inUse` Set via a per-entity x per-trackedMesh walk (with
+    // template-literal key allocation per mesh/tex) on EVERY frame. That's the
+    // one per-frame GC/CPU cost in update() with no cooldown, unlike the
+    // sibling unload-scan (every 5 frames) and stats-cosmetics (every 6
+    // frames) throttles right next to it. A still-over-budget scene pays this
+    // full O(entities) scan+allocation every frame for no new information —
+    // eviction candidates don't change frame-to-frame once the in-use set is
+    // stable. Run at most every N frames; still re-checked every frame via the
+    // cheap byteBudget comparison above so a NEWLY over-budget frame is never
+    // silently skipped for more than the cooldown window.
+    if (!this._enforceBudgetCounter) this._enforceBudgetCounter = 0;
+    if (this._enforceBudgetCounter > 0) { this._enforceBudgetCounter--; return; }
+    this._enforceBudgetCounter = 5;
     // Find evict candidates: LODs no current entity is using AND not inline.
     // Walk every asset's cached non-inline geo/tex; drop any whose key isn't
     // currently active on any entity.
@@ -3634,6 +3659,13 @@ export class ModelPool extends Emitter {
   // Tear the whole pool down: dispose every live entity, then every shared
   // asset (which deepDisposes any VRM runtime and frees cached GPU buffers).
   dispose() {
+    // Idempotency guard (mirrors Entity.dispose()'s _disposed pattern): a second
+    // call must be a safe no-op. Without this, re-disposing _impostorTier/
+    // _batchedFarTier/_occlusionTier a second time hit already-freed WebGL
+    // resources (render targets/materials) which three.js does not guarantee
+    // is safe to dispose twice.
+    if (this._disposed) return;
+    this._disposed = true;
     for (const e of [...this._entities]) e.dispose();
     for (const asset of this._assets.values()) asset.dispose();
     this._assets.clear();

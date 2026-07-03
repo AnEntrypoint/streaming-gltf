@@ -320,9 +320,32 @@ function _round(v) {
 // Parse extras.EP_cluster_lod into a normalized ClusterSet. Dependency-free,
 // browser-safe. Returns null when the extra is absent/invalid (caller falls back
 // to full-draw = stock behavior).
+// Structural validation for one raw cluster entry from possibly-hand-edited or
+// corrupted extras JSON. A truncated/malformed aabb, sphere, or lods entry would
+// otherwise silently produce NaN/undefined that corrupts frustum culling and
+// draw ranges far downstream (attachClusterLod, ClusterLodMesh) instead of
+// failing loud at the one place that actually understands the schema.
+function _isValidRawCluster(c) {
+  if (!c || typeof c !== 'object') return false;
+  if (!Array.isArray(c.aabb) || c.aabb.length !== 6 || !c.aabb.every((n) => typeof n === 'number' && Number.isFinite(n))) return false;
+  if (!Array.isArray(c.sphere) || c.sphere.length !== 4 || !c.sphere.every((n) => typeof n === 'number' && Number.isFinite(n))) return false;
+  if (!Array.isArray(c.lods) || !c.lods.length) return false;
+  for (const l of c.lods) {
+    const offset = Array.isArray(l) ? l[0] : l?.offset;
+    const count = Array.isArray(l) ? l[1] : l?.count;
+    if (typeof offset !== 'number' || !Number.isFinite(offset) || offset < 0) return false;
+    if (typeof count !== 'number' || !Number.isFinite(count) || count < 0) return false;
+  }
+  return true;
+}
+
 export function parseClusterLod(extras) {
   const meta = extras && extras[CLUSTER_LOD_EXTRA_KEY];
   if (!meta || !Array.isArray(meta.clusters) || !meta.clusters.length) return null;
+  // Fail-open (same contract as the length/array checks above): any structurally
+  // malformed cluster entry invalidates the whole payload rather than letting
+  // NaN/undefined values propagate into culling/draw-range math.
+  if (!meta.clusters.every(_isValidRawCluster)) return null;
   const clusters = meta.clusters.map((c) => ({
     aabb: c.aabb,
     sphere: c.sphere,
