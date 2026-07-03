@@ -80,6 +80,8 @@ export class WebGpuHizTier {
     this._texSizeUniform = texSize;
     this._debugBuffer = instancedArray(this._capacity, 'float');
     this._debugCPU = new Float32Array(this._capacity);
+    this._debugTexelBuffer = instancedArray(this._capacity, 'float');
+    this._debugTexelCPU = new Float32Array(this._capacity);
     if (this.renderer.getDrawingBufferSize) {
       const sz = this.renderer.getDrawingBufferSize(new THREE.Vector2());
       texSize.value.set(Math.max(1, sz.x), Math.max(1, sz.y));
@@ -102,35 +104,59 @@ export class WebGpuHizTier {
         };
         const cx = aabb.x.add(aabb.z).mul(0.5);
         const cy = aabb.y.add(aabb.w).mul(0.5);
+        const texel4 = toTexel(cx, cy);
         const d0 = textureLoad(depthTex, toTexel(aabb.x, aabb.y), 0).r;
         const d1 = textureLoad(depthTex, toTexel(aabb.z, aabb.y), 0).r;
         const d2 = textureLoad(depthTex, toTexel(aabb.x, aabb.w), 0).r;
         const d3 = textureLoad(depthTex, toTexel(aabb.z, aabb.w), 0).r;
-        const d4 = textureLoad(depthTex, toTexel(cx, cy), 0).r;
+        const d4 = textureLoad(depthTex, texel4, 0).r;
         const nearestSampledDepth = d0.min(d1).min(d2).min(d3).min(d4);
         this._debugBuffer.element(instanceIndex).assign(d4);
-        // KNOWN-BROKEN, fail-open pending a fix: live-witnessed against a
-        // real WebGPU device (browser: navigator.gpu true, WebGPURenderer
-        // backend.isWebGPUBackend true), the compute dispatch and buffer
-        // readback plumbing all work correctly (verified: candidate AABBs,
-        // depths, and dispatch/resolve counts all populate as expected), but
-        // the depth-texture SAMPLES came back near-constant regardless of
-        // screen position (0.9886 vs 0.9886 for two entities at very
-        // different screen locations), while a raw pixel readback of the
-        // SAME depth texture at those two screen fractions DID show real
-        // variation (0 vs 63 out of 255) -- meaning toTexel()'s coordinate
-        // math (or a getDrawingBufferSize/devicePixelRatio mismatch between
-        // where the RenderTarget was sized and where this kernel's texSize
-        // uniform was set) is placing every sample in the same small region
-        // of the real texture. Rather than ship a depth comparison that
-        // silently returns wrong verdicts (hiding real geometry is a
-        // user-facing correctness regression, worse than not culling at
-        // all), this stays fail-open until the coordinate bug is found and
-        // re-witnessed. Candidate diagnosis for the next pass: log toTexel's
-        // OUTPUT ivec2 into a debug buffer (not just the sampled depth) to
-        // see the actual texel coordinates being read, and cross-check
-        // against the RenderTarget's true allocated pixel dimensions vs
-        // this kernel's texSize uniform value at dispatch time.
+        // Pack the ACTUAL sampled texel coords (x in the integer part, y in
+        // the fractional part via a large scale) into a float debug slot so
+        // a CPU readback can see exactly where toTexel() pointed -- the
+        // fastest way to confirm/refute "every sample lands in the same
+        // small region" without a GPU debugger.
+        this._debugTexelBuffer.element(instanceIndex).assign(float(texel4.x).add(float(texel4.y).mul(0.0001)));
+        // KNOWN-BROKEN, fail-open pending a fix. Progress from the prior
+        // debugging pass (this comment supersedes it): toTexel()'s
+        // coordinate math is NOT the bug -- verified by packing the actual
+        // computed ivec2 into a debug buffer and reading it back: two
+        // entities at visually distinct screen positions produced distinct,
+        // plausible texel coordinates ((527,276) and (520,302) against a
+        // 1036x647 canvas, both correctly near-center matching their AABBs).
+        // The earlier "near-identical samples" finding was a MEASUREMENT
+        // ARTIFACT: readRenderTargetPixelsAsync cannot read a
+        // RenderTarget.depthTexture at all (renderTarget.textures[] has no
+        // depth slot; textureIndex:1 threw "Invalid value used as weak map
+        // key") -- the original raw-pixel probe was reading the COLOR
+        // attachment at ARBITRARY screen fractions, not the depth texture at
+        // the kernel's actual sample points. A corrected ground-truth probe
+        // (visualize the depth texture via a TSL fullscreen-quad material
+        // sampling depthTexture.r, remapped from its real [0.98,1.0] range
+        // to [0,1] before an 8-bit color readback, since the RAW range
+        // quantizes to a near-constant byte value at this precision) DOES
+        // show real per-pixel variation: front-entity sample read ~118,
+        // behind-entity sample read ~110, open-background/wall-area samples
+        // read ~169-170 (all on a 0-255 remapped scale). Given camera
+        // distance ordering (front closest, wall middle, behind farthest),
+        // the EXPECTED depths are front=nearest(smallest), wall=middle,
+        // behind=wall's-depth-if-correctly-occluded(same as wall, since
+        // occluded). Instead behind(110) read NEARER than front(118) --
+        // wrong direction, meaning the behind-entity's 5 sample taps are
+        // landing on geometry nearer than expected (possibly the AABB
+        // corners for a small, distant, off-axis entity land outside the
+        // wall's screen footprint entirely, sampling empty/background depth,
+        // or land on the front entity if the two AABBs overlap in screen
+        // space at this specific camera framing). Next-pass candidates: (a)
+        // widen the sample pattern beyond 5 corner/center taps to a small
+        // grid covering more of the AABB interior -- a screen-space AABB is
+        // a poor proxy for a 3D object's true silhouette and corner/center
+        // taps can miss it entirely for elongated or off-axis objects; (b)
+        // verify the AABB itself (not just the texel conversion) against the
+        // entity's ACTUAL screen footprint via a visual overlay in the
+        // browser, since a wrong AABB would explain wrong samples without
+        // toTexel() being at fault at all.
         this._visBuffer.element(instanceIndex).assign(uint(1));
       });
     })().compute(this._capacity);
@@ -173,6 +199,11 @@ export class WebGpuHizTier {
     if (this._debugBuffer) {
       this.renderer.getArrayBufferAsync(this._debugBuffer.value).then((buf) => {
         this._debugCPU.set(new Float32Array(buf));
+      }).catch(() => {});
+    }
+    if (this._debugTexelBuffer) {
+      this.renderer.getArrayBufferAsync(this._debugTexelBuffer.value).then((buf) => {
+        this._debugTexelCPU.set(new Float32Array(buf));
       }).catch(() => {});
     }
     this.stats.queried = queried;

@@ -114,16 +114,65 @@ window.__results = {};
         texSize: tier._texSizeUniform ? tier._texSizeUniform.value.toArray() : null,
         frontSampledDepth: tier._debugCPU ? tier._debugCPU[fi] : null,
         behindSampledDepth: tier._debugCPU ? tier._debugCPU[bi] : null,
+        frontTexel: tier._debugTexelCPU ? tier._debugTexelCPU[fi] : null,
+        behindTexel: tier._debugTexelCPU ? tier._debugTexelCPU[bi] : null,
+        drawingBufferSize: (() => { const s = new THREE.Vector2(); renderer.getDrawingBufferSize(s); return s.toArray(); })(),
+        depthRTSize: window.__depthRT ? [window.__depthRT.width, window.__depthRT.height] : null,
+        canvasSize: [canvas.width, canvas.height],
+        devicePixelRatio: window.devicePixelRatio,
       };
-      if (renderer.readRenderTargetPixelsAsync) {
-        try {
-          const rt = window.__depthRT;
-          const px1 = await renderer.readRenderTargetPixelsAsync(rt, Math.floor(rt.width * 0.5), Math.floor(rt.height * 0.3), 1, 1);
-          const px2 = await renderer.readRenderTargetPixelsAsync(rt, Math.floor(rt.width * 0.5), Math.floor(rt.height * 0.7), 1, 1);
-          window.__results.rawDepthProbe = { center: Array.from(px1), lower: Array.from(px2) };
-        } catch (e) {
-          window.__results.rawDepthProbeErr = String(e);
+      // Ground truth via VISUALIZATION: render the depth texture through a
+      // fullscreen quad material (TSL: sample depthTex, output as grayscale
+      // color) into a normal color RenderTarget, then read THAT back with
+      // readRenderTargetPixelsAsync (textureIndex 0, a real color texture --
+      // renderTarget.textures[] has no depth-texture slot at all, which is
+      // why the previous probe threw "Invalid value used as weak map key"
+      // on textureIndex:1; RenderTarget.depthTexture is a side channel the
+      // pixel-readback API was never meant to read directly).
+      try {
+        const { texture: texNode, MeshBasicNodeMaterial, vec4: vec4Tsl } = await import('three/tsl');
+        const depthTex = window.__depthRT.depthTexture;
+        // Remap depth [0.98, 1.0] -> [0,1] before visualizing (a raw .r
+        // near 0.99 quantizes to byte 252-255 regardless of real variation
+        // -- 8-bit output can't show sub-0.01 differences without rescaling
+        // the visible range first).
+        const { sub: subTsl, mul: mulTsl } = await import('three/tsl');
+        const quadMat = new THREE.MeshBasicNodeMaterial();
+        const rawDepth = texNode(depthTex).r;
+        const remapped = subTsl(rawDepth, 0.98).mul(50); // [0.98,1.0] -> [0,1]
+        quadMat.colorNode = remapped.mul(vec4Tsl(1, 1, 1, 1));
+        const quadGeo = new THREE.PlaneGeometry(2, 2);
+        const quadMesh = new THREE.Mesh(quadGeo, quadMat);
+        const quadScene = new THREE.Scene();
+        quadScene.add(quadMesh);
+        const quadCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+        const visRT = new THREE.RenderTarget(window.__depthRT.width, window.__depthRT.height);
+        renderer.setRenderTarget(visRT);
+        renderer.render(quadScene, quadCam);
+        renderer.setRenderTarget(null);
+        const fx = Math.floor(window.__results.diag.frontTexel);
+        const fy = Math.round((window.__results.diag.frontTexel - fx) * 10000);
+        const bx = Math.floor(window.__results.diag.behindTexel);
+        const by = Math.round((window.__results.diag.behindTexel - bx) * 10000);
+        const pxFront = await renderer.readRenderTargetPixelsAsync(visRT, fx, fy, 1, 1, 0);
+        const pxBehind = await renderer.readRenderTargetPixelsAsync(visRT, bx, by, 1, 1, 0);
+        // Sweep a small grid of extra probe points to check whether the
+        // visualized depth varies AT ALL across the visible canvas -- if
+        // it's near-252 everywhere, the wall (the largest, closest-to-
+        // uniform-depth object in frame) genuinely dominates most of the
+        // screen and both entities' AABB corners legitimately sample it.
+        const gridProbes = [];
+        for (const [gx, gy] of [[100, 100], [900, 100], [518, 50], [518, 600], [200, 400], [800, 400]]) {
+          const px = await renderer.readRenderTargetPixelsAsync(visRT, gx, gy, 1, 1, 0);
+          gridProbes.push({ xy: [gx, gy], v: px[0] });
         }
+        window.__results.rawDepthProbe = {
+          frontPixel: [fx, fy], behindPixel: [bx, by],
+          frontVisualizedDepth: Array.from(pxFront), behindVisualizedDepth: Array.from(pxBehind),
+          gridProbes,
+        };
+      } catch (e) {
+        window.__results.rawDepthProbeErr = String(e) + (e.stack ? ' | ' + e.stack.split('\n')[1] : '');
       }
       window.__witnessReady = true;
     }
