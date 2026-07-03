@@ -104,7 +104,15 @@ export class ClusterLodMesh extends THREE.Mesh {
     return (base + lod.offset) * bytesPerIndex;
   }
 
-  _pickLod(ci, projSize) {
+  // Squared-distance form: avoids the sqrt in distanceTo() (callers pass distSq =
+  // distanceToSquared) and the per-cluster division in projSize. Original test was
+  // `(sh*radius)/(dist*tanHalf) > eff`, i.e. `sh*radius > eff*dist*tanHalf`. Both sides
+  // are non-negative (sizes/distances/tanHalf for fov<180deg), so squaring both sides of
+  // a `>` between non-negatives preserves direction: `(sh*radius)^2 > eff^2*tanHalf^2*distSq`.
+  // sizeSq = (sh*radius)^2 and tanHalfSq = tanHalf^2 are passed in (camera/cluster inputs);
+  // this fn just compares against eff^2*tanHalfSq*distSq -- algebraically identical selection,
+  // no sqrt or division per cluster.
+  _pickLod(ci, sizeSq, distSq, tanHalfSq) {
     const t = this.lodThresholds;
     const cur = this._curLod[ci];
     let lod = t.length; // default coarsest
@@ -113,7 +121,7 @@ export class ClusterLodMesh extends THREE.Mesh {
       // to drop require falling below by -margin. Bias by current level.
       const goingUp = cur < 0 || cur > i;
       const eff = goingUp ? t[i] * (1 + this._hyst) : t[i] * (1 - this._hyst);
-      if (projSize > eff) { lod = i; break; }
+      if (sizeSq > eff * eff * tanHalfSq * distSq) { lod = i; break; }
     }
     // clamp to available LODs for this cluster
     const avail = this.clusterSet.clusters[ci].lods.length;
@@ -140,8 +148,9 @@ export class ClusterLodMesh extends THREE.Mesh {
       const tanHalf = camera.isPerspectiveCamera ? Math.tan(THREE.MathUtils.degToRad(camera.fov) * 0.5) : 1;
       _camCache.renderer = renderer; _camCache.camera = camera; _camCache.frame = frame;
       _camCache.camPos = _v.clone(); _camCache.sh = sh; _camCache.tanHalf = tanHalf;
+      _camCache.tanHalfSq = tanHalf * tanHalf;
     }
-    const camPos = _camCache.camPos, sh = _camCache.sh, tanHalf = _camCache.tanHalf;
+    const camPos = _camCache.camPos, sh = _camCache.sh, tanHalfSq = _camCache.tanHalfSq;
     const me = this.matrixWorld.elements;
     const scale = Math.max(
       Math.hypot(me[0], me[1], me[2]),
@@ -196,9 +205,13 @@ export class ClusterLodMesh extends THREE.Mesh {
       visible++;
       // Sphere center/radius still drive the projected-size LOD estimate (cheap
       // distance/radius proxy, not a cull test -- under-coverage doesn't matter here).
-      const dist = Math.max(1e-3, _sphere.center.distanceTo(camPos));
-      const projSize = (sh * _sphere.radius) / (dist * tanHalf);
-      const lodIdx = this._pickLod(ci, projSize);
+      // Squared form: distSq via distanceToSquared (no sqrt), sizeSq = (sh*radius)^2
+      // compared against eff^2*tanHalf^2*distSq -- see _pickLod's algebra comment.
+      // The original 1e-3 floor guarded `dist` before division-by-dist; squared form
+      // guards the same divide-by-~0 case by flooring distSq at 1e-6 (= (1e-3)^2).
+      const distSq = Math.max(1e-6, _sphere.center.distanceToSquared(camPos));
+      const sizeSq = (sh * _sphere.radius) * (sh * _sphere.radius);
+      const lodIdx = this._pickLod(ci, sizeSq, distSq, tanHalfSq);
       const lod = c.lods[lodIdx];
       if (!lod.count) continue;
       const base = lod.stream === 1 ? this.lod0Count : 0;     // start in ELEMENTS (groups use element offsets)
