@@ -21,7 +21,8 @@ import * as THREE from 'three';
 // frozen by the first geometry added, so every geometry must match exactly in
 // attribute set, itemSize and normalized flag). We force ONLY the attributes the
 // far material actually reads:
-//   position f32x3, color f32x4 (NON-normalized).
+//   position f32x3, color u8x4 (NORMALIZED -- baked once at add time; this
+//   sub-14px tier's color precision loss at 8 bits/channel is imperceptible).
 // The far material is UNLIT MeshBasicMaterial with vertexColors and no map, so it
 // samples NEITHER normal NOR uv (no lighting math, no texture coords). Uploading
 // them was dead per-vertex fetch bandwidth + VRAM (~20 bytes/vertex) across the
@@ -58,18 +59,34 @@ function _asFloat32(attr, itemSize) {
   return out;
 }
 
-// Produce a Float32 itemSize-4 color array regardless of the source layout
-// (missing -> white; itemSize 3 -> alpha 1; normalized int -> 0..1 floats).
+// Produce a Uint8 itemSize-4 NORMALIZED color array regardless of the source
+// layout (missing -> white; itemSize 3 -> alpha 1; normalized int -> 0..1
+// floats read back through get*() which three.js already denormalizes to
+// 0..1 for normalized source attributes). This tier is sub-14px on screen
+// (far/instanced dots) where 8-bit-per-channel color precision loss is
+// imperceptible; colors are baked ONCE here at geometry-normalize time, never
+// touched per-frame, so this is a pure init-time repack. The `true` (5th
+// three.js BufferAttribute normalized flag) maps the stored 0..255 byte back
+// to 0.0..1.0 in the shader's attribute read transparently -- verified the
+// consuming shader only touches the stock <color_vertex> chunk (plain
+// `vColor = color` / `vColor *= color` read) plus a pow() on the already-read
+// vColor varying, with no assumption about the underlying storage type, so
+// this needs zero shader changes.
 function _colorToFloat4(col, count) {
-  const out = new Float32Array(count * 4);
-  if (!col) { out.fill(1); return new THREE.BufferAttribute(out, 4, false); }
+  const out = new Uint8Array(count * 4);
+  if (!col) { out.fill(255); return new THREE.BufferAttribute(out, 4, true); }
+  const clamp255 = (v) => Math.max(0, Math.min(255, Math.round(v * 255)));
   for (let i = 0; i < count; i++) {
-    out[i * 4 + 0] = col.getX(i);
-    out[i * 4 + 1] = col.itemSize >= 2 ? col.getY(i) : col.getX(i);
-    out[i * 4 + 2] = col.itemSize >= 3 ? col.getZ(i) : col.getX(i);
-    out[i * 4 + 3] = col.itemSize >= 4 ? col.getW(i) : 1;
+    const r = col.getX(i);
+    const g = col.itemSize >= 2 ? col.getY(i) : r;
+    const b = col.itemSize >= 3 ? col.getZ(i) : r;
+    const a = col.itemSize >= 4 ? col.getW(i) : 1;
+    out[i * 4 + 0] = clamp255(r);
+    out[i * 4 + 1] = clamp255(g);
+    out[i * 4 + 2] = clamp255(b);
+    out[i * 4 + 3] = clamp255(a);
   }
-  return new THREE.BufferAttribute(out, 4, false);
+  return new THREE.BufferAttribute(out, 4, true);
 }
 
 function _asUint(arr) {
