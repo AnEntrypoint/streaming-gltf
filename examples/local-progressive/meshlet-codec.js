@@ -19,7 +19,12 @@
 // The metadata SCHEMA + the reader (parseClusterLod) are dependency-free and run
 // in the browser.
 
-export const CLUSTER_LOD_VERSION = 1;
+// v2: sphere center is no longer stored (it was only ever used as a cheap
+// distance proxy for LOD selection, never the cull test -- the AABB is the real
+// cull test and is untouched). The runtime derives center from the AABB midpoint
+// at parse time instead; only radius is still baked. parseClusterLod stays
+// backward-compatible with v1 payloads (sphere.length===4, stored center kept).
+export const CLUSTER_LOD_VERSION = 2;
 export const CLUSTER_LOD_EXTRA_KEY = 'EP_cluster_lod';
 
 // ---------------------------------------------------------------- builder ----
@@ -323,7 +328,11 @@ export function buildClusterLodExtra(result, coarseIndexAccessor = -1) {
     coarseIndexCount: result.indexCoarse.length,
     clusters: result.clusters.map((c) => ({
       aabb: c.aabb.map(_round),
-      sphere: c.sphere.map(_round),
+      // v2: radius-only -- center is re-derived from the AABB midpoint by the
+      // reader (parseClusterLod), since it was only ever used as a LOD-distance
+      // proxy (the AABB midpoint is well within the existing LOD hysteresis
+      // tolerance vs. the "true" bounding-sphere center).
+      sphere: [_round(c.sphere[3])],
       lods: c.lods.map((l) => [l.offset, l.count, l.stream]),
     })),
   };
@@ -345,7 +354,9 @@ function _round(v) {
 function _isValidRawCluster(c) {
   if (!c || typeof c !== 'object') return false;
   if (!Array.isArray(c.aabb) || c.aabb.length !== 6 || !c.aabb.every((n) => typeof n === 'number' && Number.isFinite(n))) return false;
-  if (!Array.isArray(c.sphere) || c.sphere.length !== 4 || !c.sphere.every((n) => typeof n === 'number' && Number.isFinite(n))) return false;
+  // v1 sphere = [cx,cy,cz,r] (stored center); v2 sphere = [r] (radius-only, center
+  // derived from the AABB midpoint below).
+  if (!Array.isArray(c.sphere) || (c.sphere.length !== 4 && c.sphere.length !== 1) || !c.sphere.every((n) => typeof n === 'number' && Number.isFinite(n))) return false;
   if (!Array.isArray(c.lods) || !c.lods.length) return false;
   for (const l of c.lods) {
     const offset = Array.isArray(l) ? l[0] : l?.offset;
@@ -363,15 +374,29 @@ export function parseClusterLod(extras) {
   // malformed cluster entry invalidates the whole payload rather than letting
   // NaN/undefined values propagate into culling/draw-range math.
   if (!meta.clusters.every(_isValidRawCluster)) return null;
-  const clusters = meta.clusters.map((c) => ({
-    aabb: c.aabb,
-    sphere: c.sphere,
-    lods: c.lods.map((l) =>
-      Array.isArray(l)
-        ? { offset: l[0], count: l[1], stream: l[2] || 0 }
-        : { offset: l.offset, count: l.count, stream: l.stream || 0 }
-    ),
-  }));
+  const clusters = meta.clusters.map((c) => {
+    // v1 sphere = [cx,cy,cz,r] (center as-baked); v2 sphere = [r] (radius-only) --
+    // derive center from the AABB midpoint once here at parse time (cheap, not
+    // per-frame). The AABB midpoint is well within the existing LOD-selection
+    // hysteresis tolerance vs. the "true" bounding-sphere center it replaces.
+    const sphere = c.sphere.length === 4
+      ? c.sphere
+      : [
+          (c.aabb[0] + c.aabb[3]) * 0.5,
+          (c.aabb[1] + c.aabb[4]) * 0.5,
+          (c.aabb[2] + c.aabb[5]) * 0.5,
+          c.sphere[0],
+        ];
+    return {
+      aabb: c.aabb,
+      sphere,
+      lods: c.lods.map((l) =>
+        Array.isArray(l)
+          ? { offset: l[0], count: l[1], stream: l[2] || 0 }
+          : { offset: l.offset, count: l.count, stream: l.stream || 0 }
+      ),
+    };
+  });
   return {
     version: meta.version || 1,
     lodCount: meta.lodCount || (clusters[0] && clusters[0].lods.length) || 1,
