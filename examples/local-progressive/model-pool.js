@@ -1996,17 +1996,25 @@ function _cloneObject3D(src, sourceToClone) {
 // LOD picker — same logic as the inline demo, plus a ceiling clamp.
 // For 3-LOD system: uses thresholds [50px, 25px, 10px] for LODs [0, 2, 4]
 // For 5-LOD system: uses thresholds [80, 200, 400, 800, 1400] for LODs [0, 1, 2, 3, 4]
+// Hoisted out of _pickMeshLod: these ladders are read-only (indexed/indexOf'd,
+// never mutated) so allocating them fresh on every call (this runs per tracked
+// mesh per frame) was pure per-call garbage. Module-level constants instead.
+const _LOD_THRESHOLDS_3 = [50, 25, 10]; // Adjusted for 3-LOD: LOD0@50px, LOD2@25px, LOD4@10px
+const _LOD_INDICES_3 = [0, 2, 4];
+const _LOD_THRESHOLDS_5 = [80, 200, 400, 800, 1400];
+const _LOD_INDICES_5 = [0, 1, 2, 3, 4];
+
 function _pickMeshLod(lods, screenPx, ceilingIdx, use3LodSystem = false, lodScale = 1, curLod = -1) {
   let thresholds, lodIndices;
   if (use3LodSystem && lods.length >= 5) {
     // 3-LOD system: only use LODs [0, 2, 4] with thresholds [50px, 25px, 10px]
     // This skips intermediate LODs 1 and 3, saving VRAM and reducing memory churn
-    thresholds = [50, 25, 10]; // Adjusted for 3-LOD: LOD0@50px, LOD2@25px, LOD4@10px
-    lodIndices = [0, 2, 4];
+    thresholds = _LOD_THRESHOLDS_3;
+    lodIndices = _LOD_INDICES_3;
   } else {
     // 5-LOD system (default): all LODs [0, 1, 2, 3, 4]
-    thresholds = [80, 200, 400, 800, 1400];
-    lodIndices = [0, 1, 2, 3, 4];
+    thresholds = _LOD_THRESHOLDS_5;
+    lodIndices = _LOD_INDICES_5;
   }
 
   // lodScale is the continuous FPS/VRAM control knob: scale the effective
