@@ -99,6 +99,10 @@ export class InstancedBatch {
     this._boundAttr = new THREE.InstancedBufferAttribute(this._boundArray, 4);
     this._boundAttr.setUsage(THREE.DynamicDrawUsage);
     this.mesh.geometry.setAttribute('instanceBoundSphere', this._boundAttr);
+    // Dirty-range tracking (mirror of model-pool.js's InstancedSlot fix): a single
+    // instance's bound-sphere write otherwise re-uploads the WHOLE capacity*4
+    // buffer via needsUpdate every frame any batched instance moves.
+    this._boundDirtyRuns = [];
 
     // Per-instance LOD index (0-5) — vertex shader uses this to select material
     this._lodIndexArray = new Uint8Array(this.capacity);
@@ -167,7 +171,7 @@ export class InstancedBatch {
     this._boundArray[o+1] = 0;
     this._boundArray[o+2] = 0;
     this._boundArray[o+3] = 0;
-    this._boundAttr.needsUpdate = true;
+    this._markBoundDirty(idx);
 
     this._stats.totalInstances--;
   }
@@ -225,7 +229,36 @@ export class InstancedBatch {
     this._boundArray[o+1] = cy;
     this._boundArray[o+2] = cz;
     this._boundArray[o+3] = r;
-    this._boundAttr.needsUpdate = true;
+    this._markBoundDirty(idx);
+  }
+  // Merge instance idx's touched component range into a disjoint-run list
+  // (same shape as model-pool.js's _markInstanceTexDirty/_markBoundDirty).
+  _markBoundDirty(idx) {
+    const loComp = idx * 4, hiComp = loComp + 3;
+    const runs = this._boundDirtyRuns;
+    let i = 0;
+    while (i < runs.length && runs[i][1] < loComp - 1) i++;
+    let mergedLo = loComp, mergedHi = hiComp;
+    let j = i;
+    while (j < runs.length && runs[j][0] <= hiComp + 1) {
+      if (runs[j][0] < mergedLo) mergedLo = runs[j][0];
+      if (runs[j][1] > mergedHi) mergedHi = runs[j][1];
+      j++;
+    }
+    runs.splice(i, j - i, [mergedLo, mergedHi]);
+  }
+  // Upload only the touched component runs instead of a full-buffer re-upload
+  // every frame any batched instance's bound sphere changes.
+  _flushBoundAttr() {
+    const runs = this._boundDirtyRuns;
+    if (runs.length > 0) {
+      if (typeof this._boundAttr.addUpdateRange === 'function') {
+        this._boundAttr.clearUpdateRanges();
+        for (const [lo, hi] of runs) this._boundAttr.addUpdateRange(lo, hi - lo + 1);
+      }
+      this._boundAttr.needsUpdate = true;
+      runs.length = 0;
+    }
   }
 
   // Update LOD index for an instance (when entity switches LOD within batched tier)
@@ -237,6 +270,7 @@ export class InstancedBatch {
   // Flush pending updates to GPU
   // Optimization 2: Only mark needsUpdate if dirty slots exceed threshold (5-10% of capacity)
   flushUpdates() {
+    this._flushBoundAttr();
     if (this._gpuInstanceTex) { this.flushInstanceTexture(); return; }
     if (this._dirtySlots.size > 0) {
       // ALWAYS flush dirty slots (the old 5%-of-capacity gate skipped the GPU
@@ -293,6 +327,7 @@ export class InstancedBatch {
     this._boundAttr = new THREE.InstancedBufferAttribute(newBounds, 4);
     this._boundAttr.setUsage(THREE.DynamicDrawUsage);
     next.geometry.setAttribute('instanceBoundSphere', this._boundAttr);
+    this._boundDirtyRuns = []; // fresh attribute object, nothing pending to carry over
 
     // Grow LOD index attribute
     const newLodIndices = new Uint8Array(newCap);

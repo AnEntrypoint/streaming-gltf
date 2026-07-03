@@ -66,13 +66,17 @@ function primToGeo(prim) {
 // runtime (model-pool.js _applyLod skinned branch) swaps the sibling geometry onto
 // the root's shared skeleton, so the sibling needs no skeleton of its own -- only
 // JOINTS_0/WEIGHTS_0 that index the same joints, which simplify() preserves.
-async function _bakeSkinnedLods(srcInput, io, meshIndex, primIndex, lodsDir, baseName) {
+async function _bakeSkinnedLods(srcDoc, io, meshIndex, primIndex, lodsDir, baseName) {
   const lods = [];
   for (const ratio of SKINNED_LOD_RATIOS) {
     if (ratio >= 1.0) { lods.push({ ratio: 1.0, kind: 'textured', inline: true }); continue; }
-    // Fresh read+clone per ratio so each simplify starts from the full-res source
-    // (simplify is destructive; chaining ratios would compound error).
-    const doc = await io.read(srcInput);
+    // Fresh clone per ratio so each simplify starts from the full-res source
+    // (simplify is destructive; chaining ratios would compound error). Cloned
+    // in-memory from the already-parsed source document instead of re-reading
+    // + re-parsing the GLB off disk for every ratio (was 3x redundant I/O+parse
+    // per skinned primitive; cloneDocument gives an equally-fresh independent
+    // Document via gltf-transform's own deep merge).
+    const doc = cloneDocument(srcDoc);
     const root = doc.getRoot();
     const meshes = root.listMeshes();
     const mesh = meshes[meshIndex];
@@ -148,7 +152,7 @@ async function bakeCluster(INPUT, OUTPUT) {
         // meshopt LODs (sibling GLBs + EP_progressive_lod) so a VRM/skinned model gets
         // real LOD scaling through ModelPool's skinned LOD ladder.
         try {
-          const desc = await _bakeSkinnedLods(INPUT, io, mi, pi, lodsDir, baseName);
+          const desc = await _bakeSkinnedLods(doc, io, mi, pi, lodsDir, baseName);
           if (desc) { skinnedDescs.push(desc); skinnedLodded++; }
           else skipped++;
         } catch (e) { console.warn(`[bake-cluster] skinned LOD skipped (mesh ${mi} prim ${pi}): ${e.message}`); skipped++; }

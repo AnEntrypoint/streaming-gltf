@@ -200,6 +200,11 @@ class InstancedSlot {
     this._boundAttr = new THREE.InstancedBufferAttribute(this._boundArray, 4);
     this._boundAttr.setUsage(THREE.DynamicDrawUsage);
     this.mesh.geometry.setAttribute('instanceBoundSphere', this._boundAttr);
+    // Dirty-range tracking for the bound-sphere attribute, mirroring the instance
+    // transform texture's addUpdateRange treatment: a single moving instance's
+    // sphere write otherwise re-uploads the WHOLE capacity*4 buffer every frame
+    // (see flushInstanceTexture's comment for the identical bug class).
+    this._boundDirtyRuns = [];
     // Zero out all instance matrices initially so unused slots draw nothing
     // visible (zero matrix collapses to origin point).
     const zero = new THREE.Matrix4().set(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0);
@@ -240,7 +245,7 @@ class InstancedSlot {
     // "no bound info" → also drawn at origin (zero matrix). Belt+braces.
     const o = idx * 4;
     this._boundArray[o] = 0; this._boundArray[o+1] = 0; this._boundArray[o+2] = 0; this._boundArray[o+3] = 0;
-    this._boundAttr.needsUpdate = true;
+    this._markBoundDirty(idx);
   }
   setMatrixForSlot(idx, matrix) {
     if (this._gpuInstanceTex) {
@@ -256,6 +261,7 @@ class InstancedSlot {
   // Only mark needsUpdate if dirty slots exceed threshold (5-10% of capacity)
   // This reduces GPU buffer sync stalls by batching updates across multiple frames
   flushMatrixUpdates() {
+    this._flushBoundAttr();
     if (this._gpuInstanceTex) { this.flushInstanceTexture(); return; }
     if (this._dirtySlots.size > 0) {
       // ALWAYS flush when there are dirty slots. The old 5%-of-capacity gate
@@ -273,7 +279,38 @@ class InstancedSlot {
     this._boundArray[o+1] = cy;
     this._boundArray[o+2] = cz;
     this._boundArray[o+3] = r;
-    this._boundAttr.needsUpdate = true;
+    this._markBoundDirty(idx);
+  }
+  // Insert instance idx's touched component range into a merged disjoint-run
+  // list (identical shape to _markInstanceTexDirty) so N scattered per-frame
+  // movers upload O(N) components instead of O(capacity) components.
+  _markBoundDirty(idx) {
+    const loComp = idx * 4, hiComp = loComp + 3;
+    const runs = this._boundDirtyRuns;
+    let i = 0;
+    while (i < runs.length && runs[i][1] < loComp - 1) i++;
+    let mergedLo = loComp, mergedHi = hiComp;
+    let j = i;
+    while (j < runs.length && runs[j][0] <= hiComp + 1) {
+      if (runs[j][0] < mergedLo) mergedLo = runs[j][0];
+      if (runs[j][1] > mergedHi) mergedHi = runs[j][1];
+      j++;
+    }
+    runs.splice(i, j - i, [mergedLo, mergedHi]);
+  }
+  // Upload only the touched component runs via addUpdateRange instead of a
+  // full-buffer needsUpdate re-upload every frame any instance's bound sphere
+  // changes (same fix class/rationale as flushInstanceTexture above).
+  _flushBoundAttr() {
+    const runs = this._boundDirtyRuns;
+    if (runs.length > 0) {
+      if (typeof this._boundAttr.addUpdateRange === 'function') {
+        this._boundAttr.clearUpdateRanges();
+        for (const [lo, hi] of runs) this._boundAttr.addUpdateRange(lo, hi - lo + 1);
+      }
+      this._boundAttr.needsUpdate = true;
+      runs.length = 0;
+    }
   }
   // --- GPU instance transform texture --------------------------------------
   // Texture layout: width = capacity*4 texels (4 per instance = a mat4's four
@@ -393,6 +430,7 @@ class InstancedSlot {
     this._boundAttr = new THREE.InstancedBufferAttribute(newBounds, 4);
     this._boundAttr.setUsage(THREE.DynamicDrawUsage);
     next.geometry.setAttribute('instanceBoundSphere', this._boundAttr);
+    this._boundDirtyRuns = []; // fresh attribute object, no pending partial-range upload to carry
     const parent = old.parent;
     if (parent) {
       parent.remove(old);
