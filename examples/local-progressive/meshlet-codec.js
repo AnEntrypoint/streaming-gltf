@@ -232,11 +232,20 @@ export async function buildClusterLod(geo, opts = {}) {
     return { name: a.name, itemSize: sz, normalized: !!a.normalized, array: out };
   });
 
+  // Emit Uint16 index buffers when the unified vertex table fits in 16 bits (the
+  // common small/medium mesh case) -- up to 2x smaller shipped accessor data.
+  // gltf-transform's Accessor.setArray() infers componentType from the TypedArray
+  // class (UNSIGNED_SHORT vs UNSIGNED_INT), so this is a pure schema/size win with
+  // no extra tag needed: the runtime (attachClusterLod in cluster-lod-mesh.js)
+  // already re-derives its own combined-buffer index width dynamically from the
+  // actual max vertex/index value present at load time, independent of whichever
+  // width the source accessor used, so both widths round-trip correctly.
+  const idxCtor = newVertCount <= 65536 ? Uint16Array : Uint32Array;
   return {
     vertexCount: newVertCount,
     attributes: outAttrs,
-    index: index0.toUint32(), // LOD0 of all clusters -> primitive.indices (stock full-res draw)
-    indexCoarse: indexCoarse.toUint32(), // LOD1..N -> sidecar accessor referenced from extras
+    index: index0.toTyped(idxCtor), // LOD0 of all clusters -> primitive.indices (stock full-res draw)
+    indexCoarse: indexCoarse.toTyped(idxCtor), // LOD1..N -> sidecar accessor referenced from extras
     clusters,
     lodCount,
   };
@@ -254,6 +263,14 @@ class _Grow {
     this.buf[this.length++] = v;
   }
   toUint32() { return this.buf.subarray(0, this.length).slice(); }
+  // Copy into a differently-typed array (e.g. Uint16Array) when every stored value
+  // fits -- caller (buildClusterLod) already guarantees this via newVertCount.
+  toTyped(Ctor) {
+    if (Ctor === Uint32Array) return this.toUint32();
+    const out = new Ctor(this.length);
+    out.set(this.buf.subarray(0, this.length));
+    return out;
+  }
 }
 
 // UV weights: heavier weight = stronger penalty on collapsing edges that distort
