@@ -2533,8 +2533,16 @@ export class ModelPool extends Emitter {
 
     const vertCount = posAttr.count;
 
-    // If already deinterleaved (separate buffers), skip
-    if (posAttr.buffer !== normAttr?.buffer || posAttr.buffer !== uvAttr?.buffer) {
+    // If already deinterleaved (separate underlying ArrayBuffers), skip.
+    // NOTE: THREE.BufferAttribute has no `.buffer` property (only
+    // `.array.buffer`, the underlying ArrayBuffer of the typed array; for an
+    // InterleavedBufferAttribute, `.array` is a getter that returns
+    // `.data.array`, so this same check also works for the interleaved case).
+    // The old `posAttr.buffer !== normAttr?.buffer` compared two `undefined`s
+    // and was always false, so this guard never short-circuited: every LOD
+    // load paid a full O(vertexCount) copy + a geometry.clone() even when the
+    // geometry was already deinterleaved.
+    if (posAttr.array.buffer !== normAttr?.array?.buffer || posAttr.array.buffer !== uvAttr?.array?.buffer) {
       return geometry; // Already deinterleaved or not interleaved
     }
 
