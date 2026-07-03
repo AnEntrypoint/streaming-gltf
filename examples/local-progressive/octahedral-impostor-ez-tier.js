@@ -177,7 +177,43 @@ export class OctahedralImpostorEzTier {
     this._mat4.makeScale(s, s, s);
     this._mat4.setPosition(x, y, z);
     rec.mesh.setMatrixAt(idx, this._mat4);
-    rec.mesh.instanceMatrix.needsUpdate = true;
+    this._markInstMatDirty(rec, idx);
+  }
+
+  // Insert local instance idx's 16-float component range into `rec`'s merged
+  // disjoint-run list (identical shape to InstancedSlot._markInstanceTexDirty
+  // in model-pool.js) so N scattered per-frame movers on the SAME per-asset
+  // mesh upload O(N) instances instead of O(maxInstances) instances.
+  _markInstMatDirty(rec, idx) {
+    const runs = rec.dirtyRuns || (rec.dirtyRuns = []);
+    const lo = idx * 16, hi = lo + 15;
+    let i = 0;
+    while (i < runs.length && runs[i][1] < lo - 1) i++;
+    let mergedLo = lo, mergedHi = hi;
+    let j = i;
+    while (j < runs.length && runs[j][0] <= hi + 1) {
+      if (runs[j][0] < mergedLo) mergedLo = runs[j][0];
+      if (runs[j][1] > mergedHi) mergedHi = runs[j][1];
+      j++;
+    }
+    runs.splice(i, j - i, [mergedLo, mergedHi]);
+  }
+
+  // Upload only the touched component runs per per-asset mesh via
+  // addUpdateRange instead of a full-buffer needsUpdate re-upload every frame
+  // any instance on that mesh moved. Call once per frame after all
+  // acquire/setCenter/release calls have landed.
+  flush() {
+    for (const rec of this._assetMeshes) {
+      if (!rec || !rec.dirtyRuns || rec.dirtyRuns.length === 0) continue;
+      const attr = rec.mesh.instanceMatrix;
+      if (typeof attr.addUpdateRange === 'function') {
+        attr.clearUpdateRanges();
+        for (const [lo, hi] of rec.dirtyRuns) attr.addUpdateRange(lo, hi - lo + 1);
+      }
+      attr.needsUpdate = true;
+      rec.dirtyRuns.length = 0;
+    }
   }
 
   release(entity) {
@@ -192,7 +228,7 @@ export class OctahedralImpostorEzTier {
     // Park at degenerate scale so it rasterizes nothing until recycled.
     this._mat4.makeScale(0, 0, 0);
     rec.mesh.setMatrixAt(m.localIdx, this._mat4);
-    rec.mesh.instanceMatrix.needsUpdate = true;
+    this._markInstMatDirty(rec, m.localIdx);
     rec.free.push(m.localIdx);
     rec.entityCount = Math.max(0, rec.entityCount - 1);
   }

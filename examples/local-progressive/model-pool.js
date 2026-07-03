@@ -3443,6 +3443,10 @@ export class ModelPool extends Emitter {
     for (const slot of this._instancedSlots.values()) {
       slot.flushMatrixUpdates();
     }
+    // Flush the octahedral impostor tier's dirty instance-matrix ranges (see
+    // OctahedralImpostorTier.flush — narrows the upload to only the instances
+    // acquired/moved/released this frame instead of the whole maxInstances buffer).
+    if (this._impostorTier) this._impostorTier.flush();
     const tEntities1 = performance.now();
 
     // Asset Streaming: visibility was already marked in the single entity pass

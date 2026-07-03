@@ -163,6 +163,13 @@ export class OctahedralImpostorTier {
     this._free = [];              // recycled instance ids
     this._highWater = 0;          // max id ever used + 1 (== mesh.count target)
     this._mat4 = new THREE.Matrix4();
+    // Dirty-range tracking for the instanceMatrix buffer (same fix class as
+    // InstancedSlot.flushInstanceTexture/_flushBoundAttr in model-pool.js): a
+    // single movable impostor's setCenter() otherwise re-uploads the WHOLE
+    // maxInstances*16-float buffer every frame via needsUpdate. Track merged
+    // disjoint per-instance component runs and flush via addUpdateRange once
+    // per frame instead.
+    this._instMatDirtyRuns = [];
 
     // ---- Incremental on-the-fly baking --------------------------------------
     // Persistent lit scratch scene + ortho camera reused across every asset bake,
@@ -302,7 +309,42 @@ export class OctahedralImpostorTier {
     this._mat4.makeScale(r, r, r);
     this._mat4.setPosition(x, y, z);
     this.mesh.setMatrixAt(id, this._mat4);
-    this.mesh.instanceMatrix.needsUpdate = true;
+    this._markInstMatDirty(id);
+  }
+
+  // Insert instance id's 16-float component range into a merged disjoint-run
+  // list (identical shape to InstancedSlot._markInstanceTexDirty in
+  // model-pool.js) so N scattered per-frame movers upload O(N) instances
+  // instead of O(maxInstances) instances.
+  _markInstMatDirty(id) {
+    const lo = id * 16, hi = lo + 15;
+    const runs = this._instMatDirtyRuns;
+    let i = 0;
+    while (i < runs.length && runs[i][1] < lo - 1) i++;
+    let mergedLo = lo, mergedHi = hi;
+    let j = i;
+    while (j < runs.length && runs[j][0] <= hi + 1) {
+      if (runs[j][0] < mergedLo) mergedLo = runs[j][0];
+      if (runs[j][1] > mergedHi) mergedHi = runs[j][1];
+      j++;
+    }
+    runs.splice(i, j - i, [mergedLo, mergedHi]);
+  }
+
+  // Upload only the touched component runs via addUpdateRange instead of a
+  // full-buffer needsUpdate re-upload every frame any instance moved. Call
+  // once per frame after all acquire/setCenter/release calls have landed.
+  flush() {
+    const runs = this._instMatDirtyRuns;
+    if (runs.length > 0) {
+      const attr = this.mesh.instanceMatrix;
+      if (typeof attr.addUpdateRange === 'function') {
+        attr.clearUpdateRanges();
+        for (const [lo, hi] of runs) attr.addUpdateRange(lo, hi - lo + 1);
+      }
+      attr.needsUpdate = true;
+      runs.length = 0;
+    }
   }
 
   release(entity) {
@@ -313,7 +355,7 @@ export class OctahedralImpostorTier {
     // id is recycled (InstancedMesh has no per-instance hide flag).
     this._mat4.makeScale(0, 0, 0);
     this.mesh.setMatrixAt(id, this._mat4);
-    this.mesh.instanceMatrix.needsUpdate = true;
+    this._markInstMatDirty(id);
     this._free.push(id);
     // Compact: if the highest-index instance was freed, shrink the high-water
     // mark (and mesh.count) past any now-trailing free ids so the renderer stops
