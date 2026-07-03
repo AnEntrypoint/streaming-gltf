@@ -36,11 +36,6 @@ export class GlobalMaterialPool {
     this._midMaterial = null;
     this._farMaterial = null;
 
-    // Track shader uniforms per material (shared across instances)
-    this._heroUniforms = null;
-    this._midUniforms = null;
-    this._farUniforms = null;
-
     // Initialize the materials
     this._initializeMaterials();
   }
@@ -56,12 +51,7 @@ export class GlobalMaterialPool {
         shadowSide: THREE.FrontSide,
       });
       this._heroMaterial.name = 'HERO-tier-material';
-
-      // Patch for per-instance culling in batched scenarios (if applicable)
-      this._heroUniforms = {
-        projViewMatrix: { value: new THREE.Matrix4() },
-      };
-      _patchMaterialForTier(this._heroMaterial, this._heroUniforms, 'hero');
+      _patchMaterialForTier(this._heroMaterial, 'hero');
     }
 
     // MID tier: balanced quality textured material for mid-distance entities
@@ -74,11 +64,7 @@ export class GlobalMaterialPool {
         shadowSide: THREE.FrontSide,
       });
       this._midMaterial.name = 'MID-tier-material';
-
-      this._midUniforms = {
-        projViewMatrix: { value: new THREE.Matrix4() },
-      };
-      _patchMaterialForTier(this._midMaterial, this._midUniforms, 'mid');
+      _patchMaterialForTier(this._midMaterial, 'mid');
     }
 
     // FAR tier: vertex-color material for instanced unskinned LODs
@@ -86,11 +72,7 @@ export class GlobalMaterialPool {
     {
       this._farMaterial = new THREE.MeshLambertMaterial({ vertexColors: true });
       this._farMaterial.name = 'FAR-tier-material';
-
-      this._farUniforms = {
-        projViewMatrix: { value: new THREE.Matrix4() },
-      };
-      _patchMaterialForTier(this._farMaterial, this._farUniforms, 'far');
+      _patchMaterialForTier(this._farMaterial, 'far');
     }
   }
 
@@ -140,17 +122,6 @@ export class GlobalMaterialPool {
     return true;
   }
 
-  // Update uniforms for all tier materials (called once per frame)
-  updateUniforms(projViewMatrix, cameraPos, viewport) {
-    if (!this._useGlobalMaterialPool) return;
-
-    for (const uniforms of [this._heroUniforms, this._midUniforms, this._farUniforms]) {
-      if (uniforms?.projViewMatrix) {
-        uniforms.projViewMatrix.value.copy(projViewMatrix);
-      }
-    }
-  }
-
   // Dispose of materials and cleanup
   dispose() {
     if (this._heroMaterial) this._heroMaterial.dispose();
@@ -176,14 +147,11 @@ export class GlobalMaterialPool {
 // Helper: patch a tier material to support per-instance frustum culling and LOD selection.
 // For FAR tier (instanced), this adds GPU frustum culling.
 // For HERO/MID (per-entity), this is minimal overhead.
-function _patchMaterialForTier(material, uniforms, tier) {
+function _patchMaterialForTier(material, tier) {
   const prev = material.onBeforeCompile;
 
   material.onBeforeCompile = (shader) => {
     if (prev) prev(shader);
-
-    // Add uniforms
-    shader.uniforms.projViewMatrix = uniforms.projViewMatrix;
 
     // For FAR tier, add per-instance attributes and GPU frustum culling
     if (tier === 'far') {
@@ -211,7 +179,6 @@ function _patchMaterialForTier(material, uniforms, tier) {
           '#include <common>',
           `#include <common>
 attribute vec4 instanceBoundSphere;
-uniform mat4 projViewMatrix;
 uniform vec3 cameraPos;
 uniform vec4 lodThresholds;
 uniform float fovTanHalf;

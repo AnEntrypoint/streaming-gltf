@@ -39,7 +39,6 @@ import { CLUSTER_LOD_EXTRA_KEY } from './meshlet-codec.js';
 import { DeferredLoadQueue } from './deferred-load-queue.js';
 import { LodUnloadManager } from './lod-unload-manager.js';
 import { CachedFrustumPlanes } from './frustum-cache.js';
-import { MultiDrawOptimizer } from './multi-draw-optimizer.js';
 import { BatchedFarTier } from './batched-far-tier.js';
 import { OctahedralImpostorTier } from './octahedral-impostor-tier.js';
 import { OctahedralImpostorEzTier } from './octahedral-impostor-ez-tier.js';
@@ -55,8 +54,6 @@ import { OcclusionQueryTier } from './occlusion-query-tier.js';
 // fully independent of the WebGPU tier's dependencies.
 // Phase 3 Quick-Wins optimizations
 import { VertexCompressionOptimizer } from './vertex-compression.js';
-import { DrawCallSorter, buildDrawCallDescriptors, applyDrawCallSort } from './draw-call-sorter.js';
-import { InstanceBufferPool } from './buffer-pool.js';
 
 // draco.js decodes in pure JS — no decoder path / wasm to configure.
 const _sharedDracoLoader = new DRACOLoader();
@@ -2343,10 +2340,6 @@ export class ModelPool extends Emitter {
     // [0,1,2,3,4] ladder gives a smooth gradient; epoch-gated picking + picker
     // hysteresis keep it from churning. Opt back into 3-LOD via opts.use3LodSystem.
     this._use3LodSystem = opts.use3LodSystem === true; // default false (5-LOD)
-    // ANGLE_multi_draw Optimizer: Batches 120+ FAR-tier draws into 1-3 submissions (+6-10 FPS)
-    // Initialized lazily after draw call batching is enabled
-    this._multiDrawOptimizer = null;
-    this._enableMultiDraw = opts.enableMultiDraw !== false; // default enabled
     // Worker pool for sibling-LOD fetch + decode. Defaults to 4 workers
     // (more = more concurrent decodes; each holds one three.js instance so
     // memory grows linearly). Set to 0 to disable and fall back to
@@ -2396,20 +2389,6 @@ export class ModelPool extends Emitter {
     // QW1: Vertex Attribute Compression (pack vec4 → vec3)
     this._vertexCompressionOptimizer = opts.enableVertexCompression !== false
       ? new VertexCompressionOptimizer()
-      : null;
-
-    // QW2: Draw Call Ordering (sort by material, distance, LOD)
-    this._drawCallSorter = opts.enableDrawCallSorting !== false
-      ? new DrawCallSorter()
-      : null;
-
-    // QW3: Instance Buffer Pool (pre-allocate 20 buffer chunks)
-    this._instanceBufferPool = opts.enableBufferPool !== false
-      ? new InstanceBufferPool({
-          minCapacity: opts.poolMinCapacity ?? 32,
-          maxCapacity: opts.poolMaxCapacity ?? 2048,
-          chunkCount: opts.poolChunkCount ?? 20,
-        })
       : null;
 
     // QW4: Instance Reuse Across Assets (hash LOD geometry, reuse InstancedSlots)
@@ -3534,18 +3513,6 @@ export class ModelPool extends Emitter {
     this.emit('fps', this._stats);
   }
 
-  // Initialize multi-draw optimizer (called after batching is enabled)
-  _initializeMultiDraw() {
-    if (!this._enableMultiDraw || this._multiDrawOptimizer) return;
-    try {
-      this._multiDrawOptimizer = new MultiDrawOptimizer(this.renderer, { verbose: false });
-      console.log('[pool] Multi-draw optimizer initialized:', this._multiDrawOptimizer.getStatusString());
-    } catch (e) {
-      console.warn('[pool] Failed to initialize multi-draw optimizer', e);
-      this._multiDrawOptimizer = null;
-    }
-  }
-
   // Public stats accessor (cheap, no allocation).
   getStats() {
     const stats = this._stats;
@@ -3559,7 +3526,6 @@ export class ModelPool extends Emitter {
       if (this._globalMaterialPool) stats.materialPooling = this._globalMaterialPool.getStats();
       if (this._deferredLoadQueue) stats.deferredLoading = this._deferredLoadQueue.getStats();
       if (this._lodUnloadManager) stats.unloadManager = this._lodUnloadManager.getStats();
-      if (this._multiDrawOptimizer) stats.multiDraw = this._multiDrawOptimizer.getStats();
       if (this._occlusionTier) stats.occlusion = this._occlusionTier.stats;
     }
     return stats;
