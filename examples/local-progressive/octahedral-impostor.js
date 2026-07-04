@@ -70,7 +70,7 @@ const _up = new THREE.Vector3();
 // restores renderer state (target, viewport, scissor, autoClear, clearAlpha) —
 // per-cell setViewport would otherwise leave the renderer in a corner rect.
 export function renderOctahedralViews(renderer, object3D, opts) {
-  const { grid, cellPx, center, radius, target, layer = 0 } = opts;
+  const { grid, cellPx, center, radius, target, layer = 0, generateMipmapsOnComplete = false } = opts;
 
   const scene = new THREE.Scene();
   scene.add(new THREE.AmbientLight(0xffffff, 1.6));
@@ -83,7 +83,7 @@ export function renderOctahedralViews(renderer, object3D, opts) {
   scene.add(object3D); // reparents (removes from prevParent)
 
   const cam = new THREE.OrthographicCamera(-radius, radius, radius, -radius, 0.001, radius * 4);
-  renderOctahedralCellRange(renderer, scene, cam, { grid, cellPx, center, radius, target, layer });
+  renderOctahedralCellRange(renderer, scene, cam, { grid, cellPx, center, radius, target, layer, generateMipmapsOnComplete });
 
   if (prevParent) prevParent.add(object3D); else scene.remove(object3D);
   object3D.matrixAutoUpdate = prevMatrixAuto;
@@ -98,7 +98,8 @@ export function renderOctahedralViews(renderer, object3D, opts) {
 // single frame with all grid*grid renders. Renderer state is fully restored.
 export function renderOctahedralCellRange(renderer, scene, cam, opts) {
   const { grid, cellPx, center, radius, target, layer = 0,
-    cellStart = 0, cellCount = grid * grid, clearFirst = true } = opts;
+    cellStart = 0, cellCount = grid * grid, clearFirst = true,
+    generateMipmapsOnComplete = false } = opts;
 
   // Reframe the (possibly shared) ortho camera to this asset's bound sphere.
   cam.left = -radius; cam.right = radius; cam.top = radius; cam.bottom = -radius;
@@ -120,6 +121,11 @@ export function renderOctahedralCellRange(renderer, scene, cam, opts) {
   const camDist = radius * 2;
   const total = grid * grid;
   const end = Math.min(cellStart + cellCount, total);
+  // Mip generation, when requested, must fire on the render() call that lands
+  // this chunk's LAST cell (renderer.render()'s post-render hook regenerates
+  // mips only if target.texture.generateMipmaps is true AT THAT MOMENT) — never
+  // earlier, or the mip chain would be built from a still-incomplete atlas.
+  const genMipsTex = generateMipmapsOnComplete ? target.texture : null;
   for (let k = cellStart; k < end; k++) {
     const i = k % grid, j = Math.floor(k / grid);
     octDecode(_dir, (i + 0.5) / grid, (j + 0.5) / grid);
@@ -135,8 +141,10 @@ export function renderOctahedralCellRange(renderer, scene, cam, opts) {
     const x = i * cellPx, y = j * cellPx;
     renderer.setViewport(x, y, cellPx, cellPx);
     renderer.setScissor(x, y, cellPx, cellPx);
+    if (genMipsTex && k === end - 1) genMipsTex.generateMipmaps = true;
     renderer.render(scene, cam);
   }
+  if (genMipsTex) genMipsTex.generateMipmaps = false;
 
   renderer.setViewport(prevViewport);
   renderer.setScissor(prevScissor);

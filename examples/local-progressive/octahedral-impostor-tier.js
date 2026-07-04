@@ -27,8 +27,19 @@ export class OctahedralImpostorTier {
     // TRANSPARENT gutter. Cells are packed edge-to-edge in the atlas, so without
     // it a LinearFilter tap near a billboard edge bleeds the neighbouring view's
     // texels (faint cross-view ghosting); the gutter makes that bleed land on
-    // alpha-0 texels instead. ~5% costs a hair of in-cell resolution.
-    this.padding = opts.padding ?? 1.05;
+    // alpha-0 texels instead.
+    //
+    // The gutter width also gates how many MIP levels are safe: a box/linear mip
+    // downsample at level N blends a ~2^N-texel footprint of the base image, so a
+    // feature closer than ~2^N texels to a tile edge starts bleeding into the
+    // neighbouring cell's content once mip N is sampled. At cellPx=64 the old
+    // padding=1.05 left only ~1.5px of gutter per edge (safe for mip 0 only — the
+    // ORIGINAL no-mipmap state); generating mips against that thin a gutter would
+    // bleed starting at mip 1. padding=1.23 widens the gutter to ~6px per edge
+    // (64*(1-1/1.23)/2 ≈ 6px), safe through mip 1-2 (2-4px footprint) with margin,
+    // at the cost of ~19% in-cell content resolution (vs ~5% before). This is the
+    // deliberate trade that makes `generateMipmaps: true` below bleed-safe.
+    this.padding = opts.padding ?? 1.23;
     // maxLayers * atlasPx^2 * 4 bytes is the WHOLE array-texture VRAM, allocated
     // up front (WebGL2 texStorage3D has no per-layer growth). 128 * 512^2 * 4 =
     // ~134 MB; the old 256 * 1024^2 * 4 was ~1 GB and its one-shot allocation was
@@ -39,8 +50,22 @@ export class OctahedralImpostorTier {
     this.atlasPx = this.grid * this.cellPx;
 
     // One WebGL2 array render target: layer L holds asset L's GRIDxGRID atlas.
+    // Mipmapped: this is the FAR-LOD/cheap-draw-call tier — every impostor is by
+    // construction viewed minified (else it would have swapped to a nearer LOD),
+    // so trilinear-filtered mips are a strict bandwidth win with zero shader-side
+    // decode cost.
+    //
+    // generateMipmaps stays false at rest: three.js has no standalone public "make
+    // mips now" call (WebGLTextures.updateRenderTargetMipmap is internal-only,
+    // reached from renderer.render()'s post-render hook, gated purely on
+    // texture.generateMipmaps === true at the moment that render call finishes).
+    // So the flag is flipped true -> render the LAST cell range of a layer's bake
+    // -> flipped back false, in bakeAsset/bakeChunk below — mips regenerate from
+    // that render call's now-complete atlas, and flipping back off immediately
+    // stops any OTHER asset's still-in-progress (partial) layer from having mips
+    // regenerated against incomplete content on its own next render call.
     this.atlas = new THREE.WebGLArrayRenderTarget(this.atlasPx, this.atlasPx, this.maxLayers, {
-      minFilter: THREE.LinearFilter,
+      minFilter: THREE.LinearMipmapLinearFilter,
       magFilter: THREE.LinearFilter,
       format: THREE.RGBAFormat,
       type: THREE.UnsignedByteType,
@@ -215,6 +240,7 @@ export class OctahedralImpostorTier {
     const layer = this._nextLayer++;
     renderOctahedralViews(this.renderer, object3D, {
       grid: this.grid, cellPx: this.cellPx, center: _center, radius, target: this.atlas, layer,
+      generateMipmapsOnComplete: true,
     });
 
     const desc = { layer, radius, center: _center.clone() };
@@ -272,6 +298,9 @@ export class OctahedralImpostorTier {
         grid: this.grid, cellPx: this.cellPx, center: job.center, radius: job.radius,
         target: this.atlas, layer: job.layer,
         cellStart: job.cellsDone, cellCount: take, clearFirst: job.cellsDone === 0,
+        // Only true on the chunk that lands this layer's LAST cell — the mip
+        // chain must be built once, from the complete atlas, never mid-bake.
+        generateMipmapsOnComplete: job.cellsDone + take >= total,
       });
       job.cellsDone += take;
       this._cellsRendered += take;
@@ -286,6 +315,11 @@ export class OctahedralImpostorTier {
 
     if (empty) { this._bakeJobs.delete(asset.url); return 0; }
     if (job.cellsDone >= total) {
+      // Mip chain for this layer was already built above (generateMipmapsOnComplete
+      // fired on the render() call that landed the final cell). generateMipmap on
+      // a TEXTURE_2D_ARRAY rebuilds every layer's chain from that layer's own base
+      // level, so a still-in-progress OTHER layer isn't corrupted — it's just
+      // redundantly rebuilt again (cheap) the next time it, too, completes.
       this._assetLayers.set(asset.url, { layer: job.layer, radius: job.radius, center: job.center.clone() });
       this._bakeJobs.delete(asset.url);
     }
