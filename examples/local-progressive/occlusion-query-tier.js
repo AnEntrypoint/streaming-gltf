@@ -41,6 +41,17 @@ export class OcclusionQueryTier {
     // Minimum candidate count before queries are worth their own submission
     // cost — below this, frustum culling alone is already cheap enough.
     this.minCandidates = opts.minCandidates ?? 64;
+    // Per-frame query budget: each begin/end query pair carries a real driver
+    // cost on some backends (notably ANGLE/D3D11, where query objects map to
+    // D3D11 async objects and each box render is its own tiny draw+state
+    // round-trip). Unbounded per-candidate issue made the query machinery
+    // itself a top CPU cost in large scenes. Cap issues per frame and
+    // round-robin the cursor across the candidate list so every candidate
+    // still refreshes, just over N/budget frames instead of every frame.
+    // Verdicts are sticky between refreshes (isOccluded reads the last
+    // resolved result), so slower refresh only delays flips, never pops.
+    this.maxQueriesPerFrame = opts.maxQueriesPerFrame ?? 32;
+    this._rrCursor = 0;
     this._records = new Map(); // entity -> { query, pending, occluded, lastBoxCenter, lastBoxSize }
     this._scene = new THREE.Scene();
     this._scene.add(_boxMesh);
@@ -69,18 +80,25 @@ export class OcclusionQueryTier {
       const passed = gl.getQueryParameter(rec.query, gl.QUERY_RESULT);
       rec.occluded = passed === 0;
       rec.pending = false;
+      rec.resolves = (rec.resolves || 0) + 1;
       resolved++;
       if (rec.occluded) occluded++;
     }
     this.stats.resolved = resolved;
     this.stats.occluded = occluded;
 
-    // 2. Issue new queries for this frame's candidates (bounded to minCandidates
-    //    check by the caller; here we just submit what's given).
+    // 2. Issue new queries for this frame's candidates, bounded by the
+    //    per-frame budget with a round-robin cursor so the whole candidate
+    //    set is covered over successive frames.
     this.renderer.autoClear = false;
     const prevTarget = this.renderer.getRenderTarget();
     let queried = 0;
-    for (const entity of candidates) {
+    const n = candidates.length;
+    const budget = this.maxQueriesPerFrame;
+    if (this._rrCursor >= n) this._rrCursor = 0;
+    let idx = this._rrCursor;
+    for (let examined = 0; examined < n && queried < budget; examined++, idx = (idx + 1) % n) {
+      const entity = candidates[idx];
       let rec = this._records.get(entity);
       if (!rec) {
         rec = { query: gl.createQuery(), pending: false, occluded: false };
@@ -127,6 +145,7 @@ export class OcclusionQueryTier {
       rec.pending = true;
       queried++;
     }
+    this._rrCursor = idx;
     this.renderer.setRenderTarget(prevTarget);
     this.renderer.autoClear = true;
     // Explicit flush: without it, driver-queued query commands can sit
@@ -151,6 +170,16 @@ export class OcclusionQueryTier {
   isOccluded(entity) {
     const rec = this._records.get(entity);
     return !!rec && rec.occluded;
+  }
+
+  // Monotonic count of resolved queries for this entity — lets consumers with
+  // their own hysteresis (consecutive-hidden-resolve streaks) distinguish a
+  // FRESH resolve from a stale verdict re-read, which matters now that the
+  // per-frame budget means a given candidate only refreshes every
+  // candidates/budget frames.
+  getResolveCount(entity) {
+    const rec = this._records.get(entity);
+    return rec ? (rec.resolves || 0) : 0;
   }
 
   release(entity) {
