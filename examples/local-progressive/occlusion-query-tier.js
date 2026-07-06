@@ -21,17 +21,37 @@
 // candidate, box geometry, depth-write-disabled, color-write-disabled), so
 // this is only enabled for scenes above a size where the query overhead is
 // smaller than the geometry it skips (see shouldEnable()).
+//
+// Draw submission is RAW WebGL2 (own program+VAO+gl.drawElements), not
+// renderer.render(scene,camera) per candidate. The previous per-candidate
+// renderer.render() call paid three.js's full render-graph walk
+// (projectObject/renderBufferDirect/setProgram/refreshUniformsCommon) for a
+// single box, up to maxQueriesPerFrame times EVERY frame across every
+// OcclusionQueryTier consumer (SceneOcclusion's vegetation/rock/grass
+// candidates AND ModelPool's entity occlusion both share this one class) --
+// live CPU profile at a forest-edge pose attributed several percent of total
+// frame time to exactly those three.js internals, concentrated in this call
+// pattern (a real scene amortizes that render-graph walk over hundreds of
+// objects in one render() call; this tier was invoking the same walk dozens
+// of times per frame just to draw one box each time). Mirrors the raw-GL
+// pattern spoint's client/core/TerrainOcclusion.js already uses for the
+// identical problem (mapspinner has no THREE dependency there, forcing raw GL
+// from the start). Box/AABB math is UNCHANGED (still THREE.Box3/Matrix4 --
+// that math was never the profiled cost, only the render-graph walk was), so
+// this stays a pure draw-submission swap: same ANY_SAMPLES_PASSED_CONSERVATIVE
+// query semantics, same fail-open/resolve/round-robin-budget logic, same
+// local-box caching. GPU-visible behavior (what gets queried, when a verdict
+// flips) is unchanged; only the CPU path to submit that query is cheaper.
 
 import * as THREE from 'three';
 
 const _box = new THREE.Box3();
-const _boxMesh = new THREE.Mesh(
-  new THREE.BoxGeometry(1, 1, 1),
-  new THREE.MeshBasicMaterial({ colorWrite: false, depthWrite: false, depthTest: true })
-);
-_boxMesh.frustumCulled = false;
 const _size = new THREE.Vector3();
 const _center = new THREE.Vector3();
+const _boxGeo = new THREE.BoxGeometry(1, 1, 1); // used only to read position attribute data for the raw VBO below
+const _scaleMat = new THREE.Matrix4();
+const _mvpMat = new THREE.Matrix4();
+const _mvpArr = new Float32Array(16);
 
 export class OcclusionQueryTier {
   constructor(renderer, opts = {}) {
@@ -52,14 +72,59 @@ export class OcclusionQueryTier {
     // resolved result), so slower refresh only delays flips, never pops.
     this.maxQueriesPerFrame = opts.maxQueriesPerFrame ?? 32;
     this._rrCursor = 0;
-    this._records = new Map(); // entity -> { query, pending, occluded, lastBoxCenter, lastBoxSize }
-    this._scene = new THREE.Scene();
-    this._scene.add(_boxMesh);
+    this._records = new Map(); // entity -> { query, pending, occluded, localBox, resolves }
     this.stats = { queried: 0, occluded: 0, resolved: 0, supported: this.isWebGL2 };
+    this._boxProgram = null;
+    this._boxVao = null;
   }
 
   supported() {
     return this.isWebGL2;
+  }
+
+  _ensureBoxGeometry() {
+    if (this._boxProgram) return;
+    const gl = this.gl;
+    const vs = gl.createShader(gl.VERTEX_SHADER);
+    gl.shaderSource(vs, `#version 300 es
+      uniform mat4 uMvp;
+      layout(location=0) in vec3 aPos;
+      void main(){ gl_Position = uMvp * vec4(aPos, 1.0); }`);
+    gl.compileShader(vs);
+    const fs = gl.createShader(gl.FRAGMENT_SHADER);
+    gl.shaderSource(fs, `#version 300 es
+      precision mediump float;
+      out vec4 o;
+      void main(){ o = vec4(0.0); }`);
+    gl.compileShader(fs);
+    const prog = gl.createProgram();
+    gl.attachShader(prog, vs); gl.attachShader(prog, fs); gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+      console.warn('[occlusion-query-tier] box program link failed:', gl.getProgramInfoLog(prog));
+      return;
+    }
+    this._boxProgram = { prog, uMvp: gl.getUniformLocation(prog, 'uMvp') };
+    // Reuse THREE.BoxGeometry's own generated position/index data so the raw
+    // VBO/IBO are byte-identical to what the old _boxMesh rendered (a
+    // THREE.Mesh built from the same BoxGeometry(1,1,1)) -- no hand-authored
+    // vertex/index arrays to keep in sync with three's box winding.
+    const posAttr = _boxGeo.getAttribute('position');
+    const idxAttr = _boxGeo.getIndex();
+    const vbo = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+    gl.bufferData(gl.ARRAY_BUFFER, posAttr.array, gl.STATIC_DRAW);
+    const ibo = gl.createBuffer();
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idxAttr.array, gl.STATIC_DRAW);
+    this._boxVao = gl.createVertexArray();
+    gl.bindVertexArray(this._boxVao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
+    gl.bindVertexArray(null);
+    this._indexCount = idxAttr.count;
+    this._indexType = idxAttr.array instanceof Uint32Array ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT;
   }
 
   // Called once per frame AFTER the main scene render (so the depth buffer
@@ -69,6 +134,8 @@ export class OcclusionQueryTier {
   runQueries(camera, candidates) {
     if (!this.isWebGL2 || !candidates.length) return;
     const gl = this.gl;
+    this._ensureBoxGeometry();
+    if (!this._boxProgram) return;
 
     // 1. Resolve any completed queries from previous frames first (cheap: just
     //    a getParameter poll, no stall — GL never blocks on QUERY_RESULT_AVAILABLE).
@@ -90,8 +157,14 @@ export class OcclusionQueryTier {
     // 2. Issue new queries for this frame's candidates, bounded by the
     //    per-frame budget with a round-robin cursor so the whole candidate
     //    set is covered over successive frames.
-    this.renderer.autoClear = false;
-    const prevTarget = this.renderer.getRenderTarget();
+    gl.useProgram(this._boxProgram.prog);
+    gl.bindVertexArray(this._boxVao);
+    gl.colorMask(false, false, false, false);
+    gl.depthMask(false);
+    gl.enable(gl.DEPTH_TEST);
+    gl.depthFunc(gl.LEQUAL);
+    gl.disable(gl.CULL_FACE); // query needs any front-of-depth fragment regardless of winding
+
     let queried = 0;
     const n = candidates.length;
     const budget = this.maxQueriesPerFrame;
@@ -116,7 +189,8 @@ export class OcclusionQueryTier {
       // subsequent frame just re-derives the world AABB from the cached local
       // box + entity's CURRENT matrixWorld via Box3.applyMatrix4 (the standard
       // re-derive-min/max-from-basis-vectors trick) instead of a full
-      // subtree retraversal.
+      // subtree retraversal. (Identical to the pre-rewrite logic -- only the
+      // draw submission below changed.)
       if (!rec.localBox) {
         entity.root.updateWorldMatrix(true, true);
         const worldBox = new THREE.Box3().setFromObject(entity.root);
@@ -131,23 +205,36 @@ export class OcclusionQueryTier {
       if (_box.isEmpty()) continue;
       _box.getSize(_size);
       _box.getCenter(_center);
-      _boxMesh.position.copy(_center);
-      _boxMesh.scale.copy(_size).addScalar(1e-4);
-      _boxMesh.updateMatrixWorld(true);
+      _size.addScalar(1e-4);
 
-      // three.js render() takes (scene, camera) -- a bare Mesh is not a valid
-      // first argument (three only walks .children, which a Mesh has none of
-      // by default, so nothing actually draws and every query reads back
-      // zero samples). Render the pre-built single-box _scene instead.
+      // Compose MVP for a unit box scaled+translated to [_center,_size] -- same
+      // transform the old _boxMesh.position/.scale/.updateMatrixWorld produced,
+      // now folded directly into one matrix instead of mutating a THREE.Object3D
+      // and letting renderer.render() walk it through the full render graph.
+      _scaleMat.makeScale(_size.x, _size.y, _size.z);
+      _scaleMat.setPosition(_center);
+      _mvpMat.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+      _mvpMat.multiply(_scaleMat);
+      _mvpMat.toArray(_mvpArr);
+
+      gl.uniformMatrix4fv(this._boxProgram.uMvp, false, _mvpArr);
       gl.beginQuery(gl.ANY_SAMPLES_PASSED_CONSERVATIVE, rec.query);
-      this.renderer.render(this._scene, camera);
+      gl.drawElements(gl.TRIANGLES, this._indexCount, this._indexType, 0);
       gl.endQuery(gl.ANY_SAMPLES_PASSED_CONSERVATIVE);
       rec.pending = true;
       queried++;
     }
     this._rrCursor = idx;
-    this.renderer.setRenderTarget(prevTarget);
-    this.renderer.autoClear = true;
+    gl.bindVertexArray(null);
+    gl.colorMask(true, true, true, true);
+    gl.depthMask(true);
+    // Restore three.js's expected GL state assumptions for its own next
+    // render() call: three tracks depth/cull/colorMask/program/VAO state
+    // itself via its internal state cache and does not blindly re-issue
+    // redundant state changes it believes are already in place, so any raw-GL
+    // mutation here that diverges from three's cached state must be reset
+    // before returning control to the normal render loop.
+    this.renderer.resetState();
     // Explicit flush: without it, driver-queued query commands can sit
     // unsubmitted indefinitely on some configurations (observed: queries
     // issued this way never resolved QUERY_RESULT_AVAILABLE across hundreds
@@ -190,9 +277,10 @@ export class OcclusionQueryTier {
   }
 
   dispose() {
-    for (const rec of this._records.values()) this.gl.deleteQuery(rec.query);
+    const gl = this.gl;
+    for (const rec of this._records.values()) gl.deleteQuery(rec.query);
     this._records.clear();
-    _boxMesh.geometry.dispose();
-    _boxMesh.material.dispose();
+    if (this._boxProgram) { gl.deleteProgram(this._boxProgram.prog); this._boxProgram = null; }
+    if (this._boxVao) { gl.deleteVertexArray(this._boxVao); this._boxVao = null; }
   }
 }
