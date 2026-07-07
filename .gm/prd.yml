@@ -2112,33 +2112,33 @@
   witness: 'Read tools/validate-extension.mjs in full: it validates EP_progressive_lod (the skinned discrete-LOD extension), not EP_cluster_lod (the static cluster extension parseClusterLod handles) -- different extension entirely, so ''malformed EP_cluster_lod coverage'' doesn''t apply to this tool as originally scoped; it does already have real structural + optional-ajv validation with clear per-field error messages for its own extension, and a dependency-free fallback path. No gap found in its actual scope; the equivalent malformed-payload hardening for EP_cluster_lod was delivered directly in parseClusterLod itself (parseclusterlod-malformed-extras-hardening row), which is the correct single place for it (parseClusterLod is the one parser every runtime path and this validator would need to share).'
 - id: gitignore-unblanket-gm
   title: Remove blanket .gm/ ignore (gitignore:20), add managed transient block so .gm/memories + stores track
-  witness: .gitignore:20 '.gm/' blanket; git ls-files .gm/memories == 0
-  status: pending
+  witness: .gitignore managed block replaces blanket .gm/; git ls-files .gm/memories now 73 (72 md + .flat-export-done sentinel)
+  status: completed
 - id: corpus-converged-verify
   title: 'Verify md corpus converged: content-hash-keyed md under .gm/memories, zero legacy timestamp-keyed files'
-  witness: 'ls .gm/memories: 72 md, legacy_count=0'
-  status: pending
+  witness: 'ls .gm/memories: 72 files all matching mem-[0-9a-f]{16}-N.md, zero timestamp-keyed (grep -cE mem-1[0-9]{12} == 0)'
+  status: completed
 - id: flat-dirs-byte-unchanged
   title: 'Witness flat JSON dirs (.gm/disciplines/default, default-vec) byte-unchanged by this run: hash before commit, compare after push'
-  witness: '.gm/disciplines/default: 73 json, default-vec: 73 json'
-  status: pending
+  witness: 'sha256 of sorted per-file sha256s identical pre/post: default=5c92189339a4..., default-vec=f9736680fbc6...'
+  status: completed
 - id: commit-corpus
   title: Commit .gm corpus (memories md + tracked stores) to mainline
-  witness: git ls-files .gm/memories == 0 pre-fix
-  status: pending
+  witness: 'git_finalize-9012: committed sha 167b391, 72 md + sentinel + prd.yml + mutables.yml + .gitignore'
+  status: completed
 - id: push-mainline
   title: Push corpus commit to origin default branch (remote HEAD=master; task says main -- report branch reality)
-  witness: git ls-remote --symref origin HEAD -> refs/heads/master
-  status: pending
+  witness: 'git_push-9013: b1ff78b..167b391 HEAD -> master; repo has no main branch, remote HEAD=master, reported'
+  status: completed
 - id: remote-divergence-triage
   title: Triage local HEAD 0085fa1 vs remote HEAD b1ff78b divergence before push (fetch, ahead/behind)
-  witness: git ls-remote HEAD=b1ff78b != local 0085fa1
-  status: pending
+  witness: git fetch + rev-list 0 ahead 1 behind; git_reset-9011 hard to origin/master before commit
+  status: completed
 - id: archived-repo-push-risk
   title: Repo marked archived in docs commit 0085fa1; witness whether GitHub rejects push (archived=read-only) and report blocker if so
-  witness: 'git log -1: ''docs: mark repo archived, canonical source is now spoint'''
-  status: pending
+  witness: push accepted by GitHub (b1ff78b..167b391) -- repo not archived on remote, docs-only claim
+  status: completed
 - id: final-clean-tree
   title: 'Final witness: git status --porcelain empty after push, remote reflects HEAD'
-  witness: porcelain currently empty pre-fix
-  status: pending
+  witness: git status --porcelain empty post-push; git log -1 = 167b391 matching remote
+  status: completed
