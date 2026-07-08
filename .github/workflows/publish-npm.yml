@@ -1,13 +1,13 @@
 name: Publish to npm
 
-# Bumps the patch version and publishes to npm on every push to master.
+# Bumps the patch version and publishes to npm on every push to main.
 # The version bump is committed back to the repo with [skip ci] so it does not
 # trigger another publish run. Requires an NPM_TOKEN secret (automation token)
 # in the repo settings.
 
 on:
   push:
-    branches: [master]
+    branches: [main]
   workflow_dispatch:
 
 permissions:

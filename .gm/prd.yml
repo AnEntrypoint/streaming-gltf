@@ -2146,3 +2146,60 @@
   statement: 'Verify .gm/memories/ md corpus conversion is complete and pushed to origin''s primary branch: content-hash-keyed files only, zero legacy timestamp-keyed files, zero flat JSON, clean tree, HEAD==remote.'
   witness: 'Bash: ls .gm/memories/*.md | wc -l -> 72; find .gm/memories -name *.json | wc -l -> 0; ls .gm/memories | grep -vE mem-[0-9a-f]+-[0-9]+.md -> empty (zero legacy names); git status --porcelain -> empty; git rev-parse HEAD -> 949135befedac420b7d8fc18fdeda6c1f3fff222; git ls-remote --heads origin -> master@949135b, cluster-lod@215fc30, no main. HEAD==origin/master exactly, corpus already committed+pushed by prior commits 167b391 (track md corpus) and 949135b (session state).'
   status: completed
+- id: rename-local-branch-master-to-main
+  text: 'git branch -m master main: witnessed via git rev-parse --abbrev-ref HEAD == main, git rev-parse HEAD unchanged (same commit ea08539/949135b-equivalent tip)'
+  status: pending
+- id: push-main-set-upstream
+  text: 'git push -u origin main: witnessed via git ls-remote --heads origin shows refs/heads/main at local HEAD sha, git branch -vv shows main tracking origin/main'
+  status: pending
+- id: update-workflow-triggers-deploy-pages
+  text: deploy-pages.yml on.push.branches:[master] -> [main]; witnessed via file diff/grep post-edit
+  status: pending
+- id: update-workflow-triggers-publish-npm
+  text: publish-npm.yml on.push.branches:[master] -> [main]; witnessed via file diff/grep post-edit
+  status: pending
+- id: commit-workflow-branch-rename
+  text: commit the two workflow edits with a clear message, on local main, before setting GH default branch (so default-branch flip lands on a main that already has correct triggers)
+  status: pending
+- id: push-workflow-commit-to-main
+  text: git_finalize/git_push the workflow-rename commit to origin main; witnessed via git ls-remote --heads origin refs/heads/main sha == local HEAD
+  status: pending
+- id: set-gh-default-branch-main
+  text: gh api -X PATCH repos/AnEntrypoint/streaming-gltf -f default_branch=main (or gh repo edit --default-branch main); witnessed via gh repo view --json defaultBranchRef showing main
+  status: pending
+- id: update-gh-pages-source-branch
+  text: GitHub Pages config source.branch currently reports master (build_type:workflow so it's informational/legacy classic-pages field) -- check if it auto-flips with default branch change or needs explicit gh api PATCH repos/.../pages with source.branch=main; witness via gh api repos/.../pages post-change
+  status: pending
+- id: delete-origin-master-branch
+  text: delete refs/heads/master on origin only after default branch is confirmed switched to main (deleting default branch first is refused by GitHub); witness via git ls-remote --heads origin no longer listing master
+  status: pending
+- id: delete-local-master-branch
+  text: git branch -d master locally is a no-op if branch -m already renamed it (no separate master ref remains) -- verify via git branch -a; only explicit delete needed if a stray local master ref exists
+  status: pending
+- id: verify-ci-green-on-main
+  text: after push to main, poll gh api repos/AnEntrypoint/streaming-gltf/actions/runs?branch=main for the deploy-pages and publish-npm runs triggered by the workflow-rename commit; both must reach conclusion=success (or publish-npm may legitimately no-op/skip if NPM_TOKEN absent -- distinguish real failure from expected skip)
+  status: pending
+- id: check-other-workflow-branch-refs
+  text: 'grep both workflow files for any other master reference beyond the trigger (e.g. checkout ref, badge URL, comments mentioning master) -- deploy-pages.yml badge_url and comments may reference master path implicitly via html_url; confirm no hardcoded ref: master in checkout steps'
+  status: pending
+- id: check-readme-other-docs-master-refs
+  text: codesearch/grep README.md and other repo docs for literal 'master' branch references (badge URLs, clone/checkout instructions, CI badge svg links) that should say main post-rename
+  status: pending
+- id: check-package-json-repo-refs
+  text: 'check package.json (repository/homepage fields) for any #master or /tree/master / /blob/master URL fragments needing update to main'
+  status: pending
+- id: verify-cluster-lod-branch-unaffected
+  text: cluster-lod branch (215fc30, prior session's asset-heavy branch) is untouched by this rename -- confirm it still exists post-rename and its own base/PR-target expectations (if any open PR targets master) are checked via gh pr list --base master
+  status: pending
+- id: check-local-clones-forks-external-refs
+  text: 'search (via WebSearch/gh api) for forks or external repos referencing streaming-gltf@master as a dependency pin (npm package.json git-url with #master, GitHub Actions using this repo as an action with @master) -- the task states none were found, but this row exists to record that this check happened and its witness'
+  status: pending
+- id: handle-concurrent-run-during-rename
+  text: 'edge case: if a workflow run is in-flight against master at the moment of rename/delete, GitHub keeps in-flight runs valid by commit sha not branch name -- no action needed, but verify via gh api actions/runs that no run is queued/in_progress against master before deleting it'
+  status: pending
+- id: handle-pages-deployment-continuity
+  text: 'edge case: Pages deployment environment/history references the workflow run, not the branch directly (build_type:workflow) -- after main push triggers deploy-pages, verify the live Pages URL still serves correctly (200, correct content) post-switch, not just that the workflow run succeeded'
+  status: pending
+- id: residual-scan-and-close
+  text: final git status --porcelain triage, residual-scan dispatch, and transition through VERIFY/CONSOLIDATE/COMPLETE with clean worktree and CI-green witness before reporting done
+  status: pending

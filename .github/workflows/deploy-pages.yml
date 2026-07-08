@@ -8,7 +8,7 @@ name: Deploy demo to GitHub Pages
 
 on:
   push:
-    branches: [master]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
